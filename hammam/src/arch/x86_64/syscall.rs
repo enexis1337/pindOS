@@ -124,25 +124,46 @@ unsafe extern "C" fn syscall_entry() {
         "mov rsp, [{krsp}]",
 
         // Stack must be 16-byte aligned before CALL
-        "push rcx",           // save user RIP
-        "push r11",           // save user RFLAGS
+        "push rcx",           // save user RIP           -> [rsp+56]
+        "push r11",           // save user RFLAGS        -> [rsp+48]
+        "push rdi",           // save a0                 -> [rsp+40]
+        "push rsi",           // save a1                 -> [rsp+32]
+        "push rdx",           // save a2                 -> [rsp+24]
+        "push r8",            // save arg3               -> [rsp+16]
+        "push r9",            // save arg4               -> [rsp+8]
+        "push r10",           // padding for alignment   -> [rsp+0]
+        // Stack now 16-byte aligned (8 pushes = 64 bytes)
 
         // Move syscall args to ABI calling convention for dispatch(nr, a0, a1, a2)
         // nr in RAX -> RDI (1st arg)
-        // a0 in RDI -> RSI (2nd arg)
-        // a1 in RSI -> RDX (3rd arg)
-        // a2 in RDX -> RCX (4th arg)
-        "push rdi",           // save a0
-        "push rsi",           // save a1
-        "push rdx",           // save a2
+        // a0 in [rsp+40] -> RSI (2nd arg)
+        // a1 in [rsp+32] -> RDX (3rd arg)
+        // a2 in [rsp+24] -> RCX (4th arg)
         "mov rdi, rax",       // nr -> RDI (1st arg)
-        "mov rsi, [rsp + 16]", // a0 -> RSI (2nd arg)
-        "mov rdx, [rsp + 8]",  // a1 -> RDX (3rd arg)
-        "mov rcx, [rsp + 0]",  // a2 -> RCX (4th arg)
+        "mov rsi, [rsp + 40]", // a0 -> RSI (2nd arg)
+        "mov rdx, [rsp + 32]", // a1 -> RDX (3rd arg)
+        "mov rcx, [rsp + 24]", // a2 -> RCX (4th arg)
 
         "call {dispatch}",
 
         // RAX = return value
+        // Restore registers (reverse order of push)
+        "pop r10",            // discard padding
+        "pop r9",
+        "pop r8",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop r11",
+        "pop rcx",
+
+        // Restore user RSP
+        "mov rsp, [{saved}]",
+
+        // Debug: write 'R' before sysret
+        "mov al, 'R'",
+        "mov dx, 0x3f8",
+        "out dx, al",
         "sysretq",
 
         saved    = sym SC_RSP_SAVE,
@@ -184,9 +205,6 @@ fn sys_exit(code: i32) -> i64 {
     unreachable!()
 }
 
-/// Singleton for the current address space (single AS for now).
-static ACTIVE_ASPACE: AddressSpace = AddressSpace;
-
 /// write(fd, buf, count) — вывести данные на serial
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     kprintln!("[syscall] write: fd={} buf={:#x} len={}", fd, buf_ptr, len);
@@ -194,7 +212,10 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
         return -9;
     }
 
-    let slice = match validate_user_slice(&ACTIVE_ASPACE, buf_ptr, len) {
+    let current = crate::sched::get_current_task().expect("no current task");
+    let aspace = current.address_space.lock();
+
+    let slice = match validate_user_slice(&aspace, buf_ptr, len) {
         Ok(s) => s,
         Err(_) => return -14,
     };
@@ -215,7 +236,10 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
 
 /// exec(path) — запустить новый процесс
 fn sys_exec(path_ptr: u64, path_len: u64) -> i64 {
-    let path_bytes = match validate_user_slice(&ACTIVE_ASPACE, path_ptr, path_len) {
+    let current = crate::sched::get_current_task().expect("no current task");
+    let aspace = current.address_space.lock();
+
+    let path_bytes = match validate_user_slice(&aspace, path_ptr, path_len) {
         Ok(s) => s,
         Err(_) => return -14,
     };
@@ -228,61 +252,31 @@ fn sys_exec(path_ptr: u64, path_len: u64) -> i64 {
 
     let vnode = match VFS.lock().lookup(path) {
         Ok(v) => v,
-        Err(e) => {
-            kprintln!("[syscall] exec: lookup failed: {:?}", e);
-            return -2;
-        }
+        Err(_) => return -2,
     };
 
     let stat = match vnode.stat() {
         Ok(s) => s,
-        Err(e) => {
-            kprintln!("[syscall] exec: stat failed: {:?}", e);
-            return -5;
-        }
+        Err(_) => return -5,
     };
 
-    kprintln!("[syscall] exec: file size={}", stat.size);
     let mut elf_data = vec![0u8; stat.size as usize];
-    if let Err(e) = vnode.read(0, &mut elf_data) {
-        kprintln!("[syscall] exec: read failed: {:?}", e);
+    if let Err(_) = vnode.read(0, &mut elf_data) {
         return -5;
     }
 
     let process = match Process::from_elf(next_pid(), &elf_data) {
         Ok(p) => p,
-        Err(e) => {
-            kprintln!("[syscall] exec: from_elf failed: {:?}", e);
-            return -12;
-        }
+        Err(_) => return -12,
     };
 
     let pid = process.pid;
-    let entry = process.entry_point;
-    let stack = process.user_stack_top;
-
-    // Initialize child task context for first schedule
-    // Set up kernel stack to jump to trampoline on first context switch
-    unsafe {
-        let task_ptr = Arc::as_ptr(&process.main_task) as *mut crate::sched::task::Task;
-        let task = &mut *task_ptr;
-        // Set up stack with trampoline as return address
-        let stack_top = task.kernel_stack.top;
-        let stack_ptr = (stack_top - core::mem::size_of::<u64>()) as *mut u64;
-        *stack_ptr = crate::arch::x86_64::syscall::return_to_userspace_trampoline as u64;
-        task.context.rsp = stack_ptr as u64;
-        // Store user entry/stack for trampoline
-        task.user_entry = entry;
-        task.user_stack = stack;
-    }
-
-    let process_arc = Arc::new(process);
+    let process_arc = alloc::sync::Arc::new(process);
 
     crate::sched::SCHEDULER.lock().add_task(process_arc.main_task.clone());
-    PROCESS_TABLE.lock().insert(pid, Arc::clone(&process_arc));
+    PROCESS_TABLE.lock().insert(pid, alloc::sync::Arc::clone(&process_arc));
 
-    kprintln!("[syscall] exec: spawned pid={}, entry={:#x}", pid, entry);
-    kprintln!("[syscall] exec: scheduler run_queue len after add: {}", crate::sched::SCHEDULER.lock().run_queue.len());
+    kprintln!("[syscall] exec: spawned pid={}", pid);
     pid as i64
 }
 
