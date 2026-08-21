@@ -160,10 +160,9 @@ unsafe extern "C" fn syscall_entry() {
         // Restore user RSP
         "mov rsp, [{saved}]",
 
-        // Debug: write 'R' before sysret
-        "mov al, 'R'",
-        "mov dx, 0x3f8",
-        "out dx, al",
+        // Mask R11 (RFLAGS) before sysretq - clear NT(14), VM(17), and other dangerous bits
+        "and r11, 0x3FFF",    // clear bits 14+ (NT=14, VM=17, RF=16, etc.)
+        "or r11, 0x200",      // ensure IF=1 (interrupts enabled in userspace)
         "sysretq",
 
         saved    = sym SC_RSP_SAVE,
@@ -313,7 +312,7 @@ pub unsafe fn jump_to_userspace(entry: u64, stack: u64) -> ! {
             "xor rbp, rbp",
             "sysretq",
             entry = in(reg) entry,
-            rflags = in(reg) 0x3202u64,
+            rflags = in(reg) 0x202u64,
             stack = in(reg) stack,
             options(noreturn)
         )
