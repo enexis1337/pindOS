@@ -7,11 +7,15 @@ struct InterruptStack([u8; 8192]);
 static mut INTERRUPT_STACK: InterruptStack = InterruptStack([0; 8192]);
 
 // Селекторы сегментов с RPL (Requested Privilege Level)
+// Порядок дескрипторов обязателен для SYSCALL/SYSRET (Intel SDM 5.8.8):
+//   STAR[47:32] = 0x08 (kernel code)  -> SYSCALL: CS=0x08, SS=0x08+8=0x10
+//   STAR[63:48] = 0x18 (user pair)    -> SYSRET:  SS=0x18+8=0x20, CS=0x18+16=0x28
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
-pub const USER_CODE: u16 = 0x18 | 3;  // RPL=3
-pub const USER_DATA: u16 = 0x20 | 3;  // RPL=3
-pub const TSS_SELECTOR: u16 = 0x28;
+pub const SYSRET_USER_BASE: u16 = 0x18;  // STAR[63:48], в GDT — заглушка
+pub const USER_DATA: u16 = 0x20 | 3;     // RPL=3
+pub const USER_CODE: u16 = 0x28 | 3;     // RPL=3
+pub const TSS_SELECTOR: u16 = 0x30;
 
 /// Task State Segment (TSS) для x86-64
 /// Используется для хранения rsp0 - kernel stack pointer при переходе из Ring 3
@@ -69,14 +73,19 @@ impl SegmentDescriptor {
 
     /// Code сегмент (Ring 0 или Ring 3)
     pub const fn code(dpl: u8) -> Self {
-        let flags = 0xA09B | ((dpl as u64) << 45); // P=1, DPL, S=1, Type=1011(code), L=1(64-bit)
-        SegmentDescriptor((flags << 40) | 0xFFFF)
+        // Собираем дескриптор напрямую в финальных битах, чтобы DPL не терялся.
+        //   bits 55:48 = Flags(G=1,D=0,L=1,AVL=0)=0xA0 | Limit[19:16]=0xF  -> 0xAF
+        //   bits 47:40 = Access: P=1, DPL, S=1, Type=1011(code)
+        let access = 0x9B | ((dpl & 3) << 5);
+        SegmentDescriptor(0x00AF_0000_0000_0000 | ((access as u64) << 40) | 0xFFFF)
     }
 
     /// Data сегмент (Ring 0 или Ring 3)
     pub const fn data(dpl: u8) -> Self {
-        let flags = 0xA093 | ((dpl as u64) << 45); // P=1, DPL, S=1, Type=0011(data), L=1
-        SegmentDescriptor((flags << 40) | 0xFFFF)
+        //   bits 55:48 = Flags(G=1,D=0,L=1,AVL=0)=0xA0 | Limit[19:16]=0xF  -> 0xAF
+        //   bits 47:40 = Access: P=1, DPL, S=1, Type=0011(data, read/write)
+        let access = 0x93 | ((dpl & 3) << 5);
+        SegmentDescriptor(0x00AF_0000_0000_0000 | ((access as u64) << 40) | 0xFFFF)
     }
 
     /// TSS дескриптор (системный, 16 байт = 2 дескриптора)
@@ -98,12 +107,12 @@ impl SegmentDescriptor {
 
 /// GDT таблица
 pub struct Gdt {
-    table: [u64; 7],  // 7 дескрипторов: null, kernel code, kernel data, user code, user data, TSS low, TSS high
+    table: [u64; 8],  // null, kernel code, kernel data, user base (заглушка), user data, user code, TSS low, TSS high
     tss: Tss,
 }
 
 static mut GDT: Gdt = Gdt {
-    table: [0; 7],
+    table: [0; 8],
     tss: Tss {
         reserved0: 0,
         rsp0: 0,
@@ -138,13 +147,16 @@ pub fn init() {
         // 0x10 - Kernel Data (Ring 0)
         GDT.table[2] = SegmentDescriptor::data(0).0;
         
-        // 0x18 - User Code (Ring 3, 64-bit)
-        GDT.table[3] = SegmentDescriptor::code(3).0;
+        // 0x18 - База пары user-сегментов для SYSRET (STAR[63:48]); заглушка
+        GDT.table[3] = SegmentDescriptor::null().0;
         
         // 0x20 - User Data (Ring 3)
         GDT.table[4] = SegmentDescriptor::data(3).0;
         
-        // 0x28 - TSS (системный дескриптор, 16 байт)
+        // 0x28 - User Code (Ring 3, 64-bit)
+        GDT.table[5] = SegmentDescriptor::code(3).0;
+        
+        // 0x30 - TSS (системный дескриптор, 16 байт)
         GDT.tss.iomap_base = mem::size_of::<Tss>() as u16;
         
         // Set IST1 to dedicated interrupt stack
@@ -154,12 +166,12 @@ pub fn init() {
         let tss_ptr = core::ptr::addr_of!(GDT.tss) as u64;
         let tss_limit = (mem::size_of::<Tss>() - 1) as u32;
         let tss_desc = SegmentDescriptor::tss(tss_ptr, tss_limit);
-        GDT.table[5] = tss_desc[0];
-        GDT.table[6] = tss_desc[1];
+        GDT.table[6] = tss_desc[0];
+        GDT.table[7] = tss_desc[1];
         
         // Загружаем GDT
         let gdt_ptr = core::ptr::addr_of!(GDT.table) as u64;
-        let gdt_limit = (mem::size_of::<[u64; 7]>() - 1) as u16;
+        let gdt_limit = (mem::size_of::<[u64; 8]>() - 1) as u16;
         
         // GDTR формат: [limit(2 байта)][base(8 байт)]
         let gdtr: *mut u8 = core::ptr::addr_of_mut!(GDT_DESCRIPTOR[0]);

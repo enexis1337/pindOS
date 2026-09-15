@@ -67,11 +67,12 @@ pub fn init() {
         efer |= EFER_SCE;
         wrmsr(MSR_EFER, efer);
 
-        let kernel_code = gdt::KERNEL_CODE as u64;       // 0x08
-        let user_code = gdt::USER_CODE as u64;           // 0x1B (user code CS, RPL=3)
-        // STAR layout: bits 47:32 = SYSRET CS, bits 31:0 = SYSCALL CS
-        // CPU automatically uses CS+8 for SS on both SYSCALL and SYSRET
-        let star = (user_code << 48) | (kernel_code << 32);
+        let kernel_code = gdt::KERNEL_CODE as u64;         // 0x08
+        let user_base = gdt::SYSRET_USER_BASE as u64;      // 0x18 (STAR[63:48])
+        // STAR layout:
+        //   [47:32] = kernel code -> SYSCALL: CS=0x08, SS=0x08+8=0x10 (kernel data)
+        //   [63:48] = user base   -> SYSRET:  SS=base+8=0x20, CS=base+16=0x28
+        let star = (user_base << 48) | (kernel_code << 32);
         wrmsr(MSR_STAR, star);
 
         let syscall_entry_ptr = syscall_entry as *const () as u64;
