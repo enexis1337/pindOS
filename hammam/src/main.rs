@@ -177,34 +177,28 @@ pub extern "C" fn _start_multiboot2(magic: u32, mbi_ptr: u32) -> ! {
     arch::x86_64::syscall::init();
     kprintln!("[OK] SYSCALL/SYSRET initialized");
 
+    // Initialize Local APIC timer for scheduler ticks.
+    // Делаем это ДО создания первого процесса: отображение MMIO APIC должно
+    // попасть в эталонные boot-таблицы, из которых клонируются скелеты всех
+    // процессов (иначе первый тик таймера даст #PF в адресном пространстве PID 1).
+    arch::x86_64::apic::init_timer_only();
+    kprintln!("[OK] Local APIC timer initialized");
+
     // Load ELF via Process as PID 1
     let init_process = process::Process::from_elf(1, &elf_data)
         .expect("failed to create init process");
 
     let init_process_arc = Arc::new(init_process);
-    
-    // Initialize dealduck task context for scheduler (so it can yield to children)
-    unsafe {
-        let task_ptr = Arc::as_ptr(&init_process_arc.main_task) as *mut crate::sched::task::Task;
-        let task = &mut *task_ptr;
-        let stack_top = task.kernel_stack.top;
-        let stack_ptr = (stack_top - core::mem::size_of::<u64>()) as *mut u64;
-        *stack_ptr = crate::arch::x86_64::syscall::return_to_userspace_trampoline as u64;
-        task.context.rsp = stack_ptr as u64;
-        task.user_entry = init_process_arc.entry_point;
-        task.user_stack = init_process_arc.user_stack_top;
-    }
-    
+
+    // Контекст задачи для scheduler (trampoline, CR3, user_entry/user_stack)
+    // уже проинициализирован в Process::from_elf.
+
     // Add dealduck to scheduler and set as current
     crate::sched::SCHEDULER.lock().add_task(init_process_arc.main_task.clone());
     process::PROCESS_TABLE.lock().insert(1, Arc::clone(&init_process_arc));
     process::CURRENT_PROCESS.lock().replace(Arc::clone(&init_process_arc));
 
     kprintln!("[OK] PID 1 (dealduck) created, entry={:#x}", init_process_arc.entry_point);
-
-    // Initialize Local APIC timer for scheduler ticks
-    arch::x86_64::apic::init_timer_only();
-    kprintln!("[OK] Local APIC timer initialized");
 
     kprintln!("[OK] Starting scheduler with dealduck as initial task");
     crate::sched::start_scheduler();

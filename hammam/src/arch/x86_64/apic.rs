@@ -64,7 +64,7 @@ pub fn init_local_apic() {
         LOCAL_APIC_BASE = apic_virt;
     }
 
-    unsafe { crate::interrupts::set_idt_entry(TIMER_VECTOR, crate::interrupts::timer_interrupt_entry as *const () as u64, 1); }
+    unsafe { crate::interrupts::set_idt_entry(TIMER_VECTOR, crate::interrupts::timer_interrupt_entry as *const () as u64, 0); }
     lapic_write(APIC_REG_SVR, 0x100 | SPURIOUS_VECTOR);
     calibrate_apic_timer();
     // Timer is now enabled (not masked) - will fire at calibrated interval

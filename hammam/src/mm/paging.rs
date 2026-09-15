@@ -1,4 +1,11 @@
-use crate::mm::physical::{BuddyAllocator, PhysFrame};
+use crate::mm::physical::{BuddyAllocator, PhysFrame, AllocError};
+use crate::drivers::serial::SpinMutex;
+
+/// Стабильный «эталонный» корень ядра (boot-PML4), из которого клонируются
+/// скелеты новых процессов. Захватывается при первом клонировании — в этот
+/// момент active-таблицами ещё являются boot-таблицы (PID 1 создаётся до
+/// любых переключений CR3), и они содержат только kernel-отображения.
+static KERNEL_ROOT: SpinMutex<Option<PhysFrame>> = SpinMutex::new(None);
 
 // Битовые флаги для записи таблицы страниц x86_64.
 bitflags::bitflags! {
@@ -347,6 +354,182 @@ pub fn translate_flags(virt: u64) -> Option<PageFlags> {
     }
     let pt_frame = pd.entries[pd_idx].frame()?;
 
+    let pt = unsafe { get_table(pt_frame) };
+    let pt_idx = pt_index(virt);
+    if !pt.entries[pt_idx].flags().contains(PageFlags::PRESENT) {
+        return None;
+    }
+    Some(pt.entries[pt_idx].flags())
+}
+
+/// Загружает выбранный физический фрейм PML4 в регистр CR3 (переключает адресное пространство).
+///
+/// # Safety
+/// Должно вызываться из Ring 0. Фрейм должен указывать на валидную PML4,
+/// содержащую отображение хотя бы текущих инструкций и стека ядра.
+pub unsafe fn set_cr3(frame: PhysFrame) {
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) frame.start_address,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Собирает свежую «скелетную» PML4 для нового процесса, клонируя kernel-карту.
+///
+/// Возвращаемая PML4 содержит:
+/// - приватный PD с копией 512 × 2 MiB huge-page записей identity-карты 1 GiB
+///   (в нём каждый процесс приватно разбивает huge-страницы под ELF/стек);
+/// - остальные настоящие kernel-записи PDPT (APIC MMIO и т.п.) разделяются с
+///   эталонным корнем ядра — они никогда не модифицируются процессами.
+///
+/// Пользовательские отображения (ELF, стек) каждый процесс создаёт в
+/// собственных (не разделяемых) PD/PT.
+pub fn copy_kernel_pml4(allocator: &mut BuddyAllocator) -> Result<PhysFrame, AllocError> {
+    // Эталонный корень берём из кэша (захватывается один раз при первом
+    // клонировании — это pristine boot-таблицы, см. KERNEL_ROOT).
+    let root = {
+        let mut cache = KERNEL_ROOT.lock();
+        if cache.is_none() {
+            *cache = Some(active_pml4());
+        }
+        cache.unwrap()
+    };
+
+    // SAFETY: эталонный корень присутствует (identity-карта ядра).
+    let boot_pml4 = unsafe { get_table(root) };
+    let boot_pdpt_frame = boot_pml4.entries[0]
+        .frame()
+        .ok_or(AllocError::OutOfMemory)?;
+
+    // SAFETY: фрейм PDPT из валидной иерархии эталонных таблиц.
+    let boot_pdpt = unsafe { get_table(boot_pdpt_frame) };
+    let boot_pd_frame = boot_pdpt.entries[0]
+        .frame()
+        .ok_or(AllocError::OutOfMemory)?;
+
+    // Выделяем свежие фреймы: PML4, PDPT, PD.
+    let new_pml4_frame = allocator.allocate(0)?;
+    let new_pdpt_frame = allocator.allocate(0)?;
+    let new_pd_frame = allocator.allocate(0)?;
+
+    // Приватный PD: копия 512 identity huge-page записей.
+    // SAFETY: оба фрейма отображены в identity-карте (физ. == вирт. адрес);
+    // содержимое PD ещё не используется никем, кроме копирующего кода.
+    let src_pd = unsafe { get_table(boot_pd_frame) };
+    let dst_pd = unsafe { get_table(new_pd_frame) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            src_pd.entries.as_ptr(),
+            dst_pd.entries.as_mut_ptr(),
+            512,
+        );
+    }
+
+    // Приватный PDPT: identity-PD приватный, остальные kernel-записи разделяем.
+    // SAFETY: свежевыделенный фрейм PDPT обнуляем и размечаем.
+    let new_pdpt = unsafe { get_table(new_pdpt_frame) };
+    new_pdpt.zero();
+    let pdpt_flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
+    new_pdpt.entries[0].set_frame(new_pd_frame, pdpt_flags);
+    for i in 1..512 {
+        if boot_pdpt.entries[i].flags().contains(PageFlags::PRESENT) {
+            new_pdpt.entries[i] = boot_pdpt.entries[i];
+        }
+    }
+
+    // Приватный PML4.
+    // SAFETY: свежевыделенный фрейм PML4 обнуляем и привязываем PDPT.
+    let new_pml4 = unsafe { get_table(new_pml4_frame) };
+    new_pml4.zero();
+    new_pml4.entries[0].set_frame(new_pdpt_frame, pdpt_flags);
+
+    Ok(new_pml4_frame)
+}
+
+/// Транслирует виртуальный адрес в физический адрес в произвольном (не обязательно
+/// активном) адресном пространстве. Поддерживает 4 KiB, 2 MiB и 1 GiB страницы.
+pub fn translate_in(root: PhysFrame, virt: u64) -> Option<u64> {
+    // SAFETY: таблицы адресного пространства отображены в identity-карте ядра.
+    let pml4 = unsafe { get_table(root) };
+
+    let pml4_idx = pml4_index(virt);
+    if !pml4.entries[pml4_idx].flags().contains(PageFlags::PRESENT) {
+        return None;
+    }
+    let pdpt_frame = pml4.entries[pml4_idx].frame()?;
+
+    // SAFETY: фрейм PDPT из валидной иерархии.
+    let pdpt = unsafe { get_table(pdpt_frame) };
+    let pdpt_idx = pdpt_index(virt);
+    if !pdpt.entries[pdpt_idx].flags().contains(PageFlags::PRESENT) {
+        return None;
+    }
+    // 1 GiB huge page в PDPT
+    if pdpt.entries[pdpt_idx].flags().contains(PageFlags::HUGE_PAGE) {
+        return Some(pdpt.entries[pdpt_idx].frame()?.start_address + (virt & 0x3FFF_FFFF));
+    }
+    let pd_frame = pdpt.entries[pdpt_idx].frame()?;
+
+    // SAFETY: фрейм PD из валидной иерархии.
+    let pd = unsafe { get_table(pd_frame) };
+    let pd_idx = pd_index(virt);
+    if !pd.entries[pd_idx].flags().contains(PageFlags::PRESENT) {
+        return None;
+    }
+    // 2 MiB huge page в PD
+    if pd.entries[pd_idx].flags().contains(PageFlags::HUGE_PAGE) {
+        return Some(pd.entries[pd_idx].frame()?.start_address + (virt & 0x001F_FFFF));
+    }
+    let pt_frame = pd.entries[pd_idx].frame()?;
+
+    // SAFETY: фрейм PT из валидной иерархии.
+    let pt = unsafe { get_table(pt_frame) };
+    let pt_idx = pt_index(virt);
+    if !pt.entries[pt_idx].flags().contains(PageFlags::PRESENT) {
+        return None;
+    }
+    let frame = pt.entries[pt_idx].frame()?;
+    Some(frame.start_address + (virt & 0xFFF))
+}
+
+/// Транслирует виртуальный адрес во флаги PT-записи в произвольном (не обязательно
+/// активном) адресном пространстве. Поддерживает 4 KiB, 2 MiB и 1 GiB страницы.
+pub fn translate_flags_in(root: PhysFrame, virt: u64) -> Option<PageFlags> {
+    // SAFETY: таблицы адресного пространства отображены в identity-карте ядра.
+    let pml4 = unsafe { get_table(root) };
+
+    let pml4_idx = pml4_index(virt);
+    if !pml4.entries[pml4_idx].flags().contains(PageFlags::PRESENT) {
+        return None;
+    }
+    let pdpt_frame = pml4.entries[pml4_idx].frame()?;
+
+    // SAFETY: фрейм PDPT из валидной иерархии.
+    let pdpt = unsafe { get_table(pdpt_frame) };
+    let pdpt_idx = pdpt_index(virt);
+    if !pdpt.entries[pdpt_idx].flags().contains(PageFlags::PRESENT) {
+        return None;
+    }
+    if pdpt.entries[pdpt_idx].flags().contains(PageFlags::HUGE_PAGE) {
+        return Some(pdpt.entries[pdpt_idx].flags());
+    }
+    let pd_frame = pdpt.entries[pdpt_idx].frame()?;
+
+    // SAFETY: фрейм PD из валидной иерархии.
+    let pd = unsafe { get_table(pd_frame) };
+    let pd_idx = pd_index(virt);
+    if !pd.entries[pd_idx].flags().contains(PageFlags::PRESENT) {
+        return None;
+    }
+    if pd.entries[pd_idx].flags().contains(PageFlags::HUGE_PAGE) {
+        return Some(pd.entries[pd_idx].flags());
+    }
+    let pt_frame = pd.entries[pd_idx].frame()?;
+
+    // SAFETY: фрейм PT из валидной иерархии.
     let pt = unsafe { get_table(pt_frame) };
     let pt_idx = pt_index(virt);
     if !pt.entries[pt_idx].flags().contains(PageFlags::PRESENT) {

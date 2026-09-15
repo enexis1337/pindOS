@@ -23,20 +23,33 @@ pub enum TaskState {
     Dead,
 }
 
-/// Внутренняя структура адресного пространства процесса.
-/// Пока обёртка над глобальными translate/translate_flags.
-/// В будущем будет хранить собственный корень PML4.
-pub struct AddressSpace;
+/// Адресное пространство процесса: собственный корень иерархии страниц (PML4).
+///
+/// Каждый процесс получает копию kernel-скелета (identity 1 GiB) в собственных
+/// таблицах, поэтому пользовательские отображения (ELF, стек) не пересекаются
+/// между процессами. Переключение адресных пространств происходит в
+/// `switch_context` через загрузку CR3.
+pub struct AddressSpace {
+    /// Физический адрес корневого PML4 этого адресного пространства.
+    pub root_pml4: crate::mm::PhysFrame,
+}
 
 impl AddressSpace {
-    /// Транслировать виртуальный адрес в физический (см. `mm::translate`).
-    pub fn translate(&self, vaddr: u64) -> Option<u64> {
-        crate::mm::translate(vaddr)
+    /// Создаёт новый адресное пространство, копируя текущий kernel-скелет.
+    pub fn new_kernel_root(allocator: &mut crate::mm::physical::BuddyAllocator) -> AddressSpace {
+        let root = crate::mm::copy_kernel_pml4(allocator)
+            .expect("failed to allocate kernel PML4 skeleton");
+        AddressSpace { root_pml4: root }
     }
 
-    /// Транслировать виртуальный адрес во флаги PT-записи (см. `mm::translate_flags`).
+    /// Транслировать виртуальный адрес в физический (в собственном адресном пространстве).
+    pub fn translate(&self, vaddr: u64) -> Option<u64> {
+        crate::mm::translate_in(self.root_pml4, vaddr)
+    }
+
+    /// Транслировать виртуальный адрес во флаги PT-записи (в собственном адресном пространстве).
     pub fn translate_flags(&self, vaddr: u64) -> Option<crate::mm::PageFlags> {
-        crate::mm::translate_flags(vaddr)
+        crate::mm::translate_flags_in(self.root_pml4, vaddr)
     }
 }
 

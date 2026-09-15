@@ -9,6 +9,8 @@ pub struct Context {
     pub r14: u64,
     pub r15: u64,
     pub rsp: u64,
+    /// Физический адрес PML4 задачи; загружается в CR3 при переключении.
+    pub cr3: u64,
 }
 
 impl Context {
@@ -21,6 +23,7 @@ impl Context {
             r14: 0,
             r15: 0,
             rsp: 0,
+            cr3: 0,
         }
     }
 }
@@ -56,6 +59,12 @@ pub unsafe extern "C" fn switch_context(from: *mut Context, to: *const Context) 
             "mov r13, [rsi + 24]",
             "mov r14, [rsi + 32]",
             "mov r15, [rsi + 40]",
+            // Переключаем адресное пространство целевой задачи.
+            // Обе PML4 содержат identity-карту ядра, так что текущий
+            // стек и следующий `ret` продолжают работать. RAX — scratch
+            // (мы не возвращаемся к вызывающему, options(noreturn)).
+            "mov rax, [rsi + 56]",
+            "mov cr3, rax",
             "ret",
             in("rdi") from,
             in("rsi") to,
@@ -90,6 +99,8 @@ mod tests {
             *return_slot = child_entry as u64;
 
             CHILD_CONTEXT.rsp = return_slot as u64;
+            // Остаёмся в текущем (boot) адресном пространстве.
+            CHILD_CONTEXT.cr3 = crate::mm::active_pml4().start_address;
             kprintln!("[context test] switching to child context");
             switch_context(&mut MAIN_CONTEXT as *mut Context, &CHILD_CONTEXT as *const Context);
             kprintln!("[context test] returned to main context");

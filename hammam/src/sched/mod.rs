@@ -86,7 +86,11 @@ fn insert_task_into_queue(&mut self, task: Arc<Task>) {
 
         if let Some(current) = self.current.take() {
             if current.state != TaskState::Dead {
-                self.insert_task_into_queue(current);
+                let mut key = current.vruntime.saturating_add(1);
+                while self.run_queue.contains_key(&key) {
+                    key = key.saturating_add(1);
+                }
+                self.run_queue.insert(key, current);
             }
         }
 
@@ -98,7 +102,7 @@ fn insert_task_into_queue(&mut self, task: Arc<Task>) {
         Some(next)
     }
 
-    fn schedule_locked(&mut self) -> Option<(*mut ArchContext, *const ArchContext)> {
+    fn schedule_locked(&mut self) -> Option<(*mut Task, *const Task)> {
         let current = self.current.as_ref()?.clone();
         let next = self.pick_next()?;
         if Arc::ptr_eq(&current, &next) {
@@ -112,18 +116,15 @@ fn insert_task_into_queue(&mut self, task: Arc<Task>) {
             (*next_ptr).state = TaskState::Running;
             // Update CURRENT_TASK for trampoline
             crate::sched::set_current_task(next_ptr);
-            Some((
-                &mut (*current_ptr).context as *mut ArchContext,
-                &(*next_ptr).context as *const ArchContext,
-            ))
+            Some((current_ptr, next_ptr))
         }
     }
 
-    pub fn schedule(&mut self) -> Option<(*mut ArchContext, *const ArchContext)> {
+    pub fn schedule(&mut self) -> Option<(*mut Task, *const Task)> {
         self.schedule_locked()
     }
 
-    pub fn tick(&mut self) -> Option<(*mut ArchContext, *const ArchContext)> {
+    pub fn tick(&mut self) -> Option<(*mut Task, *const Task)> {
         let current = self.current.as_ref()?;
         unsafe {
             let current_ptr = Arc::as_ptr(current) as *mut Task;
@@ -145,18 +146,44 @@ pub static SCHEDULER: SpinMutex<Scheduler> = SpinMutex::new(Scheduler::new());
 
 static mut MAIN_CONTEXT: ArchContext = ArchContext::new();
 
+/// Переключает ядро на целевую задачу: обновляет kernel-стек (SYSCALL), TSS.rsp0
+/// и CR3, затем выполняет низкоуровневый `switch_context`. Не возвращается.
+///
+/// # Safety
+/// `from` — текущая задача (её контекст будет сохранён), `to` — целевая задача.
+/// Обе должны иметь валидные kernel-стеки и адресные пространства.
+pub unsafe fn switch_to_task(from: *mut Task, to: *const Task) -> ! {
+    unsafe {
+        let to_task = &*to;
+        // SYSCALL entry и аппаратные прерывания (TSS.rsp0) используют kernel-стек
+        // именно той задачи, которая сейчас исполняется.
+        crate::arch::gdt::set_kernel_stack(to_task.kernel_stack.top as u64);
+        crate::arch::x86_64::syscall::set_kernel_stack(to_task.kernel_stack.top as u64);
+
+        let from_ctx = &mut (*from).context as *mut ArchContext;
+        let to_ctx = &to_task.context as *const ArchContext;
+        switch_context(from_ctx, to_ctx);
+    }
+    unreachable!()
+}
+
 pub fn create_kernel_thread(main: extern "C" fn() -> !) -> Arc<Task> {
     use alloc::sync::Arc;
     use crate::sched::task::{AddressSpace, Mutex};
 
-    let mut task = Arc::new(Task::new(task::TaskId(0), 1, Arc::new(Mutex::new(AddressSpace))));
+    let address_space = {
+        let mut allocator = crate::mm::PHYSICAL_ALLOCATOR.lock();
+        Arc::new(Mutex::new(AddressSpace::new_kernel_root(&mut allocator)))
+    };
+    let task = Arc::new(Task::new(task::TaskId(0), 1, address_space));
 
     let stack_top = task.kernel_stack.top;
-    let stack_ptr = unsafe { stack_top - core::mem::size_of::<u64>() } as *mut u64;
+    let stack_ptr = (stack_top - core::mem::size_of::<u64>()) as *mut u64;
     unsafe { *stack_ptr = main as u64 };
     unsafe {
         let task_ptr = Arc::as_ptr(&task) as *mut Task;
         (*task_ptr).context.rsp = stack_ptr as u64;
+        (*task_ptr).context.cr3 = crate::mm::active_pml4().start_address;
         (*task_ptr).state = TaskState::Ready;
     }
 
@@ -176,7 +203,7 @@ pub fn exit_current() -> ! {
     };
 
     if let Some((from, to)) = return_pair {
-        unsafe { switch_context(from, to) }
+        unsafe { switch_to_task(from, to) }
     }
 
     kprintln!("[sched] no more tasks, halting");
@@ -186,27 +213,40 @@ pub fn exit_current() -> ! {
 }
 
 pub fn start_scheduler() {
-    let (from, to) = {
+    let (kernel_stack_top, cr3, to) = {
         let scheduler = SCHEDULER.lock();
-        let to = &scheduler.current.as_ref().unwrap().context as *const ArchContext;
+        let current = scheduler.current.as_ref().unwrap();
+        let current_ptr = Arc::as_ptr(current) as *mut Task;
         // Set CURRENT_TASK for trampoline
-        let current_ptr = Arc::as_ptr(scheduler.current.as_ref().unwrap()) as *mut Task;
         crate::sched::set_current_task(current_ptr);
-        (&raw mut MAIN_CONTEXT as *mut ArchContext, to)
+        unsafe {
+            (
+                (*current_ptr).kernel_stack.top,
+                (*current_ptr).context.cr3,
+                &(*current_ptr).context as *const ArchContext,
+            )
+        }
     };
-    unsafe { switch_context(from, to) }
+
+    unsafe {
+        // Перед первым входом в userspace настроим kernel-стек и адресное пространство.
+        crate::arch::gdt::set_kernel_stack(kernel_stack_top as u64);
+        crate::arch::x86_64::syscall::set_kernel_stack(kernel_stack_top as u64);
+        crate::mm::set_cr3(crate::mm::PhysFrame::new(cr3));
+        switch_context(&raw mut MAIN_CONTEXT as *mut ArchContext, to)
+    }
 }
 
 pub fn schedule_now() {
     let pair = {
         let mut scheduler = SCHEDULER.lock();
-        kprintln!("[sched] schedule_now: current={:?}, run_queue_len={}", 
+        kprintln!("[sched] schedule_now: current={:?}, run_queue_len={}",
             scheduler.current.as_ref().map(|t| t.id.0), scheduler.run_queue.len());
         scheduler.schedule()
     };
     if let Some((from, to)) = pair {
         kprintln!("[sched] switching context");
-        unsafe { switch_context(from, to) }
+        unsafe { switch_to_task(from, to) }
     } else {
         kprintln!("[sched] no switch needed");
     }
@@ -232,7 +272,7 @@ pub fn tick_now() {
     };
     if let Some((from, to)) = pair {
         kprintln!("[tick] context switch");
-        unsafe { switch_context(from, to) }
+        unsafe { switch_to_task(from, to) }
     }
 }
 
