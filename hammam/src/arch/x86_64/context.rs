@@ -42,35 +42,31 @@ impl Default for Context {
 /// - `from` обязан оставаться доступным после переключения, так как текущий стек будет сохранён в нём.
 /// - `to.rsp` должен указывать на корректный стек, содержащий валидный адрес возврата.
 /// - Функция должна вызываться только на архитектуре x86_64 с соответствующей ABI.
+#[unsafe(naked)]
 pub unsafe extern "C" fn switch_context(from: *mut Context, to: *const Context) {
-    unsafe {
-        core::arch::asm!(
-            "mov [rdi + 0], rbx",
-            "mov [rdi + 8], rbp",
-            "mov [rdi + 16], r12",
-            "mov [rdi + 24], r13",
-            "mov [rdi + 32], r14",
-            "mov [rdi + 40], r15",
-            "mov [rdi + 48], rsp",
-            "mov rsp, [rsi + 48]",
-            "mov rbx, [rsi + 0]",
-            "mov rbp, [rsi + 8]",
-            "mov r12, [rsi + 16]",
-            "mov r13, [rsi + 24]",
-            "mov r14, [rsi + 32]",
-            "mov r15, [rsi + 40]",
-            // Переключаем адресное пространство целевой задачи.
-            // Обе PML4 содержат identity-карту ядра, так что текущий
-            // стек и следующий `ret` продолжают работать. RAX — scratch
-            // (мы не возвращаемся к вызывающему, options(noreturn)).
-            "mov rax, [rsi + 56]",
-            "mov cr3, rax",
-            "ret",
-            in("rdi") from,
-            in("rsi") to,
-            options(noreturn)
-        );
-    }
+    // MUST be naked: с обычным прологом LLVM сохраняет кадр (push rbp) и
+    // встроенный asm захватывал бы rsp на 8 байт выше реального ret-slot.
+    // В naked-функции rsp на входе указывает ровно на адрес возврата
+    // (возврат из `call switch_context`), который и сохраняем в from.rsp.
+    core::arch::naked_asm!(
+        "mov [rdi + 0], rbx",
+        "mov [rdi + 8], rbp",
+        "mov [rdi + 16], r12",
+        "mov [rdi + 24], r13",
+        "mov [rdi + 32], r14",
+        "mov [rdi + 40], r15",
+        "mov [rdi + 48], rsp",
+        "mov rsp, [rsi + 48]",
+        "mov rbx, [rsi + 0]",
+        "mov rbp, [rsi + 8]",
+        "mov r12, [rsi + 16]",
+        "mov r13, [rsi + 24]",
+        "mov r14, [rsi + 32]",
+        "mov r15, [rsi + 40]",
+        "mov rax, [rsi + 56]",
+        "mov cr3, rax",
+        "ret",
+    );
 }
 
 #[cfg(test)]

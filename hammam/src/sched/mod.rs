@@ -147,12 +147,14 @@ pub static SCHEDULER: SpinMutex<Scheduler> = SpinMutex::new(Scheduler::new());
 static mut MAIN_CONTEXT: ArchContext = ArchContext::new();
 
 /// Переключает ядро на целевую задачу: обновляет kernel-стек (SYSCALL), TSS.rsp0
-/// и CR3, затем выполняет низкоуровневый `switch_context`. Не возвращается.
+/// и CR3, затем выполняет низкоуровневый `switch_context`.
+///
+/// Возвращается, когда задача позже снова получит CPU (лежит в `from` контексте).
 ///
 /// # Safety
 /// `from` — текущая задача (её контекст будет сохранён), `to` — целевая задача.
 /// Обе должны иметь валидные kernel-стеки и адресные пространства.
-pub unsafe fn switch_to_task(from: *mut Task, to: *const Task) -> ! {
+pub unsafe fn switch_to_task(from: *mut Task, to: *const Task) {
     unsafe {
         let to_task = &*to;
         // SYSCALL entry и аппаратные прерывания (TSS.rsp0) используют kernel-стек
@@ -162,9 +164,28 @@ pub unsafe fn switch_to_task(from: *mut Task, to: *const Task) -> ! {
 
         let from_ctx = &mut (*from).context as *mut ArchContext;
         let to_ctx = &to_task.context as *const ArchContext;
+
+        if crate::arch::x86_64::syscall::SC_DEBUG {
+            const N: usize = 6;
+            let base = (to_task.context.rsp as usize / 8).saturating_sub(N) * 8;
+            crate::kprintln!("[ctx] f{}->t{} trsp={:#x} tcr3={:#x} top={:#x} prv={:#x}",
+                (*from).id.0, to_task.id.0,
+                to_task.context.rsp, to_task.context.cr3,
+                to_task.kernel_stack.top,
+                *((to_task.context.rsp as *const u64)),
+            );
+            unsafe {
+                let mut line = alloc::string::String::new();
+                for i in 0..(2*N+2) {
+                    use alloc::fmt::Write;
+                    let _ = write!(line, " {:x}", *((base + i*8) as *const u64));
+                }
+                crate::kprintln!("[ctx]  stack:{}", line);
+            }
+        }
+
         switch_context(from_ctx, to_ctx);
     }
-    unreachable!()
 }
 
 pub fn create_kernel_thread(main: extern "C" fn() -> !) -> Arc<Task> {

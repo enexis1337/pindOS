@@ -5,10 +5,11 @@ use crate::process::{PROCESS_TABLE, CURRENT_PROCESS, next_pid, Process};
 use crate::vfs::VFS;
 use alloc::vec;
 
-/// Saved user RSP during syscall entry (SYSCALL does NOT switch stacks).
-pub static mut SC_RSP_SAVE: u64 = 0;
 /// Kernel stack RSP used by syscall_entry.
 pub static mut SC_KERNEL_RSP: u64 = 0;
+
+/// Debug switch dump enabled (set from boot).
+pub static mut SC_DEBUG: bool = false;
 
 /// Ошибки syscall операций
 #[derive(Debug, Clone, Copy)]
@@ -120,36 +121,42 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         // Вход: RAX=nr, RDI=a0, RSI=a1, RDX=a2, RCX=RIP, R11=RFLAGS
-        // Сохранить user RSP
-        "mov [{saved}], rsp",
-        "mov rsp, [{krsp}]",
+        // SYSCALL не меняет стек: RSP всё ещё указывает на userspace.
+        // Сохраняем user RSP на НАШЕМ kernel-стеке первым слотом (не в
+        // глобальной переменной — между switch внутри syscall другие задачи
+        // работают на своих kernel-стеках и не тронут наш слот).
+        "mov r10, rsp",           // user RSP -> r10
+        "mov rsp, [{krsp}]",      // switch to this task's kernel stack
 
-        // Stack must be 16-byte aligned before CALL
-        "push rcx",           // save user RIP           -> [rsp+56]
-        "push r11",           // save user RFLAGS        -> [rsp+48]
-        "push rdi",           // save a0                 -> [rsp+40]
-        "push rsi",           // save a1                 -> [rsp+32]
-        "push rdx",           // save a2                 -> [rsp+24]
-        "push r8",            // save arg3               -> [rsp+16]
-        "push r9",            // save arg4               -> [rsp+8]
-        "push r10",           // padding for alignment   -> [rsp+0]
-        // Stack now 16-byte aligned (8 pushes = 64 bytes)
+        // 10 pushes = 80 bytes, стек команд 16-выровнен.
+        // rsp после всех push = top-80:
+        "push r10",           // user RSP            -> [rsp+72]
+        "push rcx",           // user RIP            -> [rsp+64]
+        "push r11",           // user RFLAGS         -> [rsp+56]
+        "push rdi",           // save a0             -> [rsp+48]
+        "push rsi",           // save a1             -> [rsp+40]
+        "push rdx",           // save a2             -> [rsp+32]
+        "push r8",            // save a3             -> [rsp+24]
+        "push r9",            // save a4             -> [rsp+16]
+        "push rbx",           // padding             -> [rsp+8]
+        "push rbp",           // padding             -> [rsp+0]
 
         // Move syscall args to ABI calling convention for dispatch(nr, a0, a1, a2)
         // nr in RAX -> RDI (1st arg)
-        // a0 in [rsp+40] -> RSI (2nd arg)
-        // a1 in [rsp+32] -> RDX (3rd arg)
-        // a2 in [rsp+24] -> RCX (4th arg)
+        // a0 in [rsp+48] -> RSI (2nd arg)
+        // a1 in [rsp+40] -> RDX (3rd arg)
+        // a2 in [rsp+32] -> RCX (4th arg)
         "mov rdi, rax",       // nr -> RDI (1st arg)
-        "mov rsi, [rsp + 40]", // a0 -> RSI (2nd arg)
-        "mov rdx, [rsp + 32]", // a1 -> RDX (3rd arg)
-        "mov rcx, [rsp + 24]", // a2 -> RCX (4th arg)
+        "mov rsi, [rsp + 48]", // a0 -> RSI (2nd arg)
+        "mov rdx, [rsp + 40]", // a1 -> RDX (3rd arg)
+        "mov rcx, [rsp + 32]", // a2 -> RCX (4th arg)
 
         "call {dispatch}",
 
         // RAX = return value
         // Restore registers (reverse order of push)
-        "pop r10",            // discard padding
+        "pop rbp",            // discard padding
+        "pop rbx",            // discard padding
         "pop r9",
         "pop r8",
         "pop rdx",
@@ -157,16 +164,13 @@ unsafe extern "C" fn syscall_entry() {
         "pop rdi",
         "pop r11",
         "pop rcx",
+        "pop rsp",            // restore user RSP from [top-8] slot
 
-        // Restore user RSP
-        "mov rsp, [{saved}]",
-
-        // Mask R11 (RFLAGS) before sysretq - clear NT(14), VM(17), and other dangerous bits
-        "and r11, 0x3FFF",    // clear bits 14+ (NT=14, VM=17, RF=16, etc.)
+        // Mask R11 (RFLAGS) before sysretq - clear dangerous bits, keep IOPL(12-13)
+        "and r11, 0x3FFF",    // keep bits 0..13 (IF=9, IOPL=12-13, DF=10)
         "or r11, 0x200",      // ensure IF=1 (interrupts enabled in userspace)
         "sysretq",
 
-        saved    = sym SC_RSP_SAVE,
         krsp     = sym SC_KERNEL_RSP,
         dispatch = sym syscall_dispatch,
     );
@@ -313,7 +317,7 @@ pub unsafe fn jump_to_userspace(entry: u64, stack: u64) -> ! {
             "xor rbp, rbp",
             "sysretq",
             entry = in(reg) entry,
-            rflags = in(reg) 0x202u64,
+            rflags = in(reg) 0x3202u64,
             stack = in(reg) stack,
             options(noreturn)
         )

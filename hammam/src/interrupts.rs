@@ -97,6 +97,9 @@ pub unsafe extern "C" fn timer_interrupt_entry() {
         "push r9",
         "push r10",
         "push r11",
+        // EOI BEFORE tick_now: если tick_now переключит контекст (switch_task),
+        // обработчик не дойдёт до конца, а ISR-бит APIC останется выставлен
+        // и заблокирует все дальнейшие таймерные прерывания.
         "call {}",
         "call {}",
         "pop r11",
@@ -109,7 +112,7 @@ pub unsafe extern "C" fn timer_interrupt_entry() {
         "pop rcx",
         "pop rax",
         "iretq",
-        sym crate::sched::tick_now_debug,
         sym crate::arch::x86_64::apic::lapic_eoi,
+        sym crate::sched::tick_now_debug,
     );
 }
