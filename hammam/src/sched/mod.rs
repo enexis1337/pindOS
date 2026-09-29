@@ -80,31 +80,95 @@ fn insert_task_into_queue(&mut self, task: Arc<Task>) {
     }
 
     pub fn pick_next(&mut self) -> Option<Arc<Task>> {
-        if self.run_queue.is_empty() {
+        self.pick_next_impl(false)
+    }
+
+    /// Выбор следующей задачи для пути `sys_yield`.
+    ///
+    /// В отличие от таймерного пути, текущая задача здесь НЕ участвует в выборе:
+    /// её `vruntime` не растёт на `yield` (только на `tick`), поэтому при обычном
+    /// `pick_next` она снова выигрывает минимум своим же `vruntime + 1` и `yield`
+    /// не отдаёт CPU. Если других готовых задач нет, остаёмся на текущей.
+    fn pick_next_excluding_current(&mut self) -> Option<Arc<Task>> {
+        self.pick_next_impl(true)
+    }
+
+    fn pick_next_impl(&mut self, exclude_current: bool) -> Option<Arc<Task>> {
+        let current = self.current.take();
+
+        if self.run_queue.is_empty() && !exclude_current {
+            self.current = current;
             return None;
         }
 
-        if let Some(current) = self.current.take() {
-            if current.state != TaskState::Dead {
-                let mut key = current.vruntime.saturating_add(1);
-                while self.run_queue.contains_key(&key) {
-                    key = key.saturating_add(1);
-                }
-                self.run_queue.insert(key, current);
+        // Текущую задачу возвращаем в очередь только если она готова к запуску.
+        // Zombie (Dead) и Blocked в run_queue возвращать нельзя.
+        if let Some(current) = current.as_ref() {
+            if !exclude_current {
+                self.enqueue_ready(current);
             }
         }
 
-        let (&next_vruntime, next_task) = self.run_queue.iter().next()?;
-        let next = next_task.clone();
-        self.run_queue.remove(&next_vruntime);
-        self.min_vruntime = next_vruntime;
-        self.current = Some(next.clone());
-        Some(next)
+        let picked = {
+            let (&next_vruntime, next_task) = match self.run_queue.iter().next() {
+                Some(entry) => entry,
+                // Других готовых задач нет: остаёмся на текущей, не теряя её.
+                None => {
+                    if exclude_current {
+                        if let Some(current) = current.as_ref() {
+                            self.enqueue_ready(current);
+                        }
+                    }
+                    self.current = current;
+                    return None;
+                }
+            };
+            let next = next_task.clone();
+            self.run_queue.remove(&next_vruntime);
+            self.min_vruntime = next_vruntime;
+            next
+        };
+
+        // На пути yield текущая задача возвращается в очередь уже после выбора,
+        // иначе она была бы кандидатом на немедленное повторное переключение.
+        if let Some(current) = current.as_ref() {
+            if exclude_current {
+                self.enqueue_ready(current);
+            }
+        }
+
+        self.current = Some(picked.clone());
+        Some(picked)
+    }
+
+    /// Кладёт задачу в run_queue с минимальным свободным ключом от `vruntime`.
+    fn enqueue_ready(&mut self, task: &Arc<Task>) {
+        // Running сюда тоже попадает: текущая задача помечается Running в
+        // `schedule_locked_with` и на момент её повторной постановки в очередь
+        // всё ещё имеет это состояние.
+        if matches!(task.state, TaskState::Dead | TaskState::Blocked) {
+            return;
+        }
+        let mut key = task.vruntime.saturating_add(1);
+        while self.run_queue.contains_key(&key) {
+            key = key.saturating_add(1);
+        }
+        self.run_queue.insert(key, task.clone());
     }
 
     fn schedule_locked(&mut self) -> Option<(*mut Task, *const Task)> {
+        self.schedule_locked_with(false)
+    }
+
+    /// `yield_path = true` — текущая задача исключается из выбора (см.
+    /// `pick_next_excluding_current`). `false` — обычный CFS-путь таймера.
+    fn schedule_locked_with(&mut self, yield_path: bool) -> Option<(*mut Task, *const Task)> {
         let current = self.current.as_ref()?.clone();
-        let next = self.pick_next()?;
+        let next = if yield_path {
+            self.pick_next_excluding_current()
+        } else {
+            self.pick_next()
+        }?;
         if Arc::ptr_eq(&current, &next) {
             return None;
         }
@@ -122,6 +186,11 @@ fn insert_task_into_queue(&mut self, task: Arc<Task>) {
 
     pub fn schedule(&mut self) -> Option<(*mut Task, *const Task)> {
         self.schedule_locked()
+    }
+
+    /// Ручное переключение по просьбе самой задачи (`sys_yield`).
+    pub fn schedule_yield(&mut self) -> Option<(*mut Task, *const Task)> {
+        self.schedule_locked_with(true)
     }
 
     pub fn tick(&mut self) -> Option<(*mut Task, *const Task)> {
@@ -263,7 +332,7 @@ pub fn schedule_now() {
         let mut scheduler = SCHEDULER.lock();
         kprintln!("[sched] schedule_now: current={:?}, run_queue_len={}",
             scheduler.current.as_ref().map(|t| t.id.0), scheduler.run_queue.len());
-        scheduler.schedule()
+        scheduler.schedule_yield()
     };
     if let Some((from, to)) = pair {
         kprintln!("[sched] switching context");
