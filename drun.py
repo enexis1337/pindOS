@@ -18,6 +18,15 @@ import os
 from pathlib import Path
 from datetime import datetime
 
+# Построчная буферизация: при перенаправлении в пайп (`python drun.py -T | ...`)
+# stdout по умолчанию блокируется, и наши print() застревают в буфере, тогда как
+# QEMU пишет в тот же fd напрямую. Из-за этого COM1-вывод терялся.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
 # ── Пути ──────────────────────────────────────────────────────────────────────
 ROOT        = Path(__file__).parent.resolve()
 DRUNNED     = ROOT / "drunned"
