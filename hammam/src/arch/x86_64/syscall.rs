@@ -308,6 +308,18 @@ fn sys_waitpid(pid: u64, flags: u64) -> i64 {
 }
 
 /// Прыжок в userspace через SYSRET.
+///
+/// ВНИМАНИЕ (IOPL): в RFLAGS ниже намеренно стоит 0x3202 — это IOPL=3
+/// (биты 12-13). Именно IOPL=3 позволяет Ring 3 выполнять `in`/`out` на
+/// портах 0xCF8/0xCFC, а без них userspace не может ходить по PCI-шине.
+/// Проверено в QEMU: с 0x0202 (IOPL=0) net-server зависает сразу после
+/// "starting virtio-net driver..." — первый же портовый доступ ловит #GP.
+///
+/// TODO(security): IOPL=3 для ВСЕХ процессов оставлять нельзя. Правильное
+/// решение по нашей архитектуре — IOPL=0 в userspace плюс I/O permission
+/// bitmap в TSS, выдаваемая конкретному процессу по capability `IoPort`
+/// (см. план). Bitmap сейчас не инициализируется, поэтому переход на IOPL=0
+/// требует сначала реализовать его, иначе PCI-доступ полностью отвалится.
 pub unsafe fn jump_to_userspace(entry: u64, stack: u64) -> ! {
     unsafe {
         core::arch::asm!(
