@@ -1,8 +1,8 @@
 use core::alloc::{GlobalAlloc, Layout};
 use crate::drivers::serial::SpinMutex;
 
-/// Размер кучи ядра (256 KiB)
-pub const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+/// Размер кучи ядра
+pub const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
 /// Статическая область памяти в секции BSS, используемая в качестве кучи ядра.
 static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
