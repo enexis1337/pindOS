@@ -1,7 +1,20 @@
-use crate::unit::{ServiceUnit, ServiceState, RestartPolicy};
+use crate::unit::{ServiceUnit, ServiceState, RestartPolicy, RESTART_LIMIT, RESTART_WINDOW};
 use alloc::vec::Vec;
 
 extern crate alloc;
+
+/// -ECHILD от нашего sys_waitpid: процесс уже не отслеживается ядром.
+const ECHILD: i64 = -10;
+
+/// Результат неблокирующего sys_waitpid(WNOHANG).
+enum WaitResult {
+    /// Процесс жив, код не доступен.
+    StillRunning,
+    /// Процесс завершился, ядро вернуло его код возврата.
+    Exited(i32),
+    /// Ядро не знает такой pid (-ECHILD).
+    NoChild,
+}
 
 pub struct ServiceManager {
     units: Vec<ServiceUnit>,
@@ -50,20 +63,36 @@ impl ServiceManager {
     pub fn run(&mut self) -> ! {
         loop {
             for i in 0..self.units.len() {
+                // Окно перезапусков тикает только пока сервис жив: иначе
+                // «упал при старте» и «простоял дольше окна» неразличимы.
                 if self.units[i].state == ServiceState::Running {
                     if let Some(pid) = self.units[i].pid {
-                        let status = self.waitpid_nonblock(pid);
-                        if status == Some(0) || status.map(|s| s < 0).unwrap_or(false) {
-                            self.units[i].state = ServiceState::Failed;
-                            crate::println!("[dealduck] {} exited, restarting...", self.units[i].name);
-                            if self.units[i].restart == RestartPolicy::OnFailure {
-                                let exec_path = self.units[i].exec_path;
-                                if let Some(new_pid) = self.spawn(exec_path) {
-                                    self.units[i].state = ServiceState::Running;
-                                    self.units[i].pid   = Some(new_pid);
+                        match self.waitpid_nonblock(pid) {
+                            WaitResult::Exited(code) => {
+                                if code == 0 {
+                                    // Штатный выход: OnFailure перезапускать не должен.
+                                    self.units[i].state = ServiceState::Stopped;
+                                    self.units[i].pid = None;
+                                    crate::println!("[dealduck] {} exited cleanly, not restarting", self.units[i].name);
+                                } else {
+                                    self.units[i].state = ServiceState::Failed;
+                                    self.handle_failure(i);
                                 }
                             }
+                            WaitResult::NoChild => {
+                                // -ECHILD: ядро уже не знает про этот pid.
+                                self.units[i].state = ServiceState::Failed;
+                                self.units[i].pid = None;
+                                crate::println!("[dealduck] {}: ECHILD, giving up", self.units[i].name);
+                            }
+                            WaitResult::StillRunning => {}
                         }
+                    }
+                } else if self.units[i].window_left > 0 {
+                    self.units[i].window_left -= 1;
+                    if self.units[i].window_left == 0 {
+                        // Окно закрылось без превышения лимита: счётчик сбрасываем.
+                        self.units[i].restarts = 0;
                     }
                 }
             }
@@ -78,7 +107,44 @@ impl ServiceManager {
         }
     }
 
-    fn waitpid_nonblock(&self, pid: u32) -> Option<i32> {
+    /// Решить, перезапускать ли упавший сервис, с учётом RestartPolicy и лимита.
+    fn handle_failure(&mut self, i: usize) {
+        let name = self.units[i].name;
+        crate::println!("[dealduck] {} exited, restarting...", name);
+
+        if self.units[i].restart != RestartPolicy::OnFailure {
+            return;
+        }
+
+        // Открываем окно, если оно закрыто, и считаем попытку.
+        if self.units[i].window_left == 0 {
+            self.units[i].restarts = 0;
+            self.units[i].window_left = RESTART_WINDOW;
+        }
+
+        if self.units[i].restarts >= RESTART_LIMIT {
+            self.units[i].state = ServiceState::Failed;
+            self.units[i].pid = None;
+            crate::println!("[dealduck] {}: start limit reached ({} restarts in {} cycles), not restarting", name, self.units[i].restarts, RESTART_WINDOW);
+            return;
+        }
+
+        self.units[i].restarts += 1;
+        let exec_path = self.units[i].exec_path;
+        match self.spawn(exec_path) {
+            Some(new_pid) => {
+                self.units[i].state = ServiceState::Running;
+                self.units[i].pid = Some(new_pid);
+            }
+            None => {
+                self.units[i].state = ServiceState::Failed;
+                self.units[i].pid = None;
+                crate::println!("[dealduck] FAILED to restart {}", name);
+            }
+        }
+    }
+
+    fn waitpid_nonblock(&self, pid: u32) -> WaitResult {
         let result: i64;
         unsafe {
             core::arch::asm!(
@@ -89,6 +155,10 @@ impl ServiceManager {
                 lateout("rax") result,
             );
         }
-        if result == 0 { None } else { Some(result as i32) }
+        match result {
+            0 => WaitResult::StillRunning,
+            r if r == -ECHILD => WaitResult::NoChild,
+            r => WaitResult::Exited(r as i32),
+        }
     }
 }

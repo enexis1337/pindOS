@@ -112,13 +112,11 @@ fn insert_task_into_queue(&mut self, task: Arc<Task>) {
         let picked = {
             let (&next_vruntime, next_task) = match self.run_queue.iter().next() {
                 Some(entry) => entry,
-                // Других готовых задач нет: остаёмся на текущей, не теряя её.
+                // Других готовых задач нет: остаёмся на текущей. Возвращать её в
+                // очередь здесь нельзя — она остаётся current, иначе задача
+                // навсегда лежит в run_queue вторым экземпляром, а yield больше не
+                // сможет её выбрать (бесконечный фантом в run_queue).
                 None => {
-                    if exclude_current {
-                        if let Some(current) = current.as_ref() {
-                            self.enqueue_ready(current);
-                        }
-                    }
                     self.current = current;
                     return None;
                 }
