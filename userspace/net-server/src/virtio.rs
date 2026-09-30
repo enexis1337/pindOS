@@ -48,6 +48,8 @@ pub struct Virtqueue {
     queue_idx: u16,
     /// Следующий дескриптор для публикации в avail ring (RX).
     next_post: u16,
+    /// Размер очереди, прочитанный у устройства (QUEUE_SIZE, io_base+12).
+    qsize: usize,
 }
 
 unsafe fn dbg_outb(port: u16, val: u8) {
@@ -87,10 +89,28 @@ impl Virtqueue {
         // и второй вызов обнулил бы статус, сбросив конфигурацию первой.
         // Handshake делает start_device() один раз, до настройки очередей.
 
-        let desc_bytes  = core::mem::size_of::<VirtqDesc>() * QUEUE_SIZE;
+        dbg_str("[virtio] QUEUE_SEL\n");
+        outw(io_base + 14, queue_idx);
+
+        // Размер очереди читаем у устройства, а не берём константой: QEMU
+        // сообщает фактический QUEUE_SIZE, и жёсткое 256 могло не совпасть.
+        let qsize = inw(io_base + 12) as usize;
+        let qsize = if qsize == 0 { QUEUE_SIZE } else { qsize };
+        dbg_str(&alloc::format!("[virtio] queue {} size={} (const {})\n", queue_idx, qsize, QUEUE_SIZE));
+
+        // Legacy-раскладка: desc, затем avail, затем used со смещения,
+        // округлённого вверх до 4096. Раньше used стоял сразу за avail без
+        // выравнивания, из-за чего устройство читало кольцо used по
+        // неверному адресу и ничего не доставляло.
+        let desc_bytes  = core::mem::size_of::<VirtqDesc>() * qsize;
         let avail_bytes = core::mem::size_of::<VirtqAvail>();
         let used_bytes  = core::mem::size_of::<VirtqUsed>();
-        let total = desc_bytes + avail_bytes + used_bytes;
+
+        let used_offset = align_up(desc_bytes + avail_bytes, 4096);
+        let total = used_offset + used_bytes;
+        dbg_str(&alloc::format!("[virtio] layout: desc={} avail={} used_off={:#x} total={}\n",
+            desc_bytes, avail_bytes, used_offset, total));
+
         dbg_str("[virtio] alloc_zeroed\n");
 
         let layout = Layout::from_size_align(total, 4096).expect("layout");
@@ -99,21 +119,19 @@ impl Virtqueue {
 
         let desc  = ptr as *mut VirtqDesc;
         let avail = ptr.add(desc_bytes) as *mut VirtqAvail;
-        let used  = ptr.add(desc_bytes + avail_bytes) as *mut VirtqUsed;
+        let used  = ptr.add(used_offset) as *mut VirtqUsed;
 
-        for i in 0..QUEUE_SIZE - 1 {
+        for i in 0..qsize - 1 {
             (*desc.add(i)).next  = (i + 1) as u16;
             (*desc.add(i)).flags = 1;
         }
 
-        dbg_str("[virtio] QUEUE_SEL\n");
-        outw(io_base + 14, queue_idx);
         dbg_str("[virtio] QUEUE_PFN\n");
         outl(io_base + 8,  (ptr as u32) / 4096);
 
         dbg_str("[virtio] init done\n");
 
-        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, next_post: 0 };
+        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, next_post: 0, qsize };
         // Для RX-очереди дескрипторы должны быть опубликованы в avail ring:
         // иначе у устройства нет ни одного буфера, куда писать, used.idx
         // никогда не растёт и recv() всегда возвращает None.
@@ -131,7 +149,7 @@ impl Virtqueue {
         let mut posted = 0usize;
         while posted < count {
             let idx = self.next_post as usize;
-            if idx >= QUEUE_SIZE - 1 { break; }
+            if idx >= self.qsize - 1 { break; }
             self.next_post += 1;
 
             let layout = match Layout::from_size_align(BUF_SIZE, 4096) { Ok(l) => l, Err(_) => break };
@@ -143,7 +161,7 @@ impl Virtqueue {
             (*self.desc.add(idx)).flags = 0; // WRITE: устройство пишет в буфер
             (*self.desc.add(idx)).next  = 0;
 
-            let avail_idx = (*self.avail).idx as usize % QUEUE_SIZE;
+            let avail_idx = (*self.avail).idx as usize % self.qsize;
             (*self.avail).ring[avail_idx] = idx as u16;
             fence(Ordering::Release);
             (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
@@ -165,7 +183,7 @@ impl Virtqueue {
         (*self.desc.add(idx)).len   = data.len() as u32;
         (*self.desc.add(idx)).flags = 0;
 
-        let avail_idx = (*self.avail).idx as usize % QUEUE_SIZE;
+        let avail_idx = (*self.avail).idx as usize % self.qsize;
         (*self.avail).ring[avail_idx] = idx as u16;
         fence(Ordering::Release);
         (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
@@ -177,7 +195,7 @@ impl Virtqueue {
     pub unsafe fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
         if (*self.used).idx == self.last_used { return None; }
 
-        let elem = &(*self.used).ring[self.last_used as usize % QUEUE_SIZE];
+        let elem = &(*self.used).ring[self.last_used as usize % self.qsize];
         let desc = &*self.desc.add(elem.id as usize);
         let len  = (elem.len as usize).min(buf.len());
 
@@ -193,6 +211,17 @@ impl Virtqueue {
 
         Some(len)
     }
+}
+
+/// Округляет `v` вверх до кратного `align` (степень двойки).
+const fn align_up(v: usize, align: usize) -> usize {
+    (v + align - 1) & !(align - 1)
+}
+
+unsafe fn inw(port: u16) -> u16 {
+    let v: u16;
+    core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nostack));
+    v
 }
 
 unsafe fn outw(port: u16, val: u16) {
