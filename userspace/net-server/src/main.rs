@@ -208,6 +208,11 @@ fn main() -> i32 {
         // smoltcp не начинает ARP-резолвинг, пока некуда отправлять пакет.
         // Периодически шлём UDP на шлюз: это заставляет интерфейс искать его
         // MAC через ARP (и, transitively, даёт трафик для 5d).
+        // Диагностика RX-кольца раз в 20000 итераций.
+        if idle_polls % 20000 == 0 && idle_polls > 0 {
+            unsafe { device.rx_queue.dump_rx_state("poll") };
+        }
+
         if idle_polls % 500 == 0 {
             match sockets.get_mut::<udp::Socket>(udp_handle).send(1, (gateway, 9)) {
                 Ok(buf) => buf[0] = 0xAA,

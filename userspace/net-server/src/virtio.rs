@@ -20,16 +20,15 @@ const BUF_COUNT: usize = 32;
 // Карта регистров legacy virtio-pci (I/O BAR0). Это НЕ MMIO-карта virtio-mmio:
 // у legacy-pci смещения маленькие, а Status — однобайтовый регистр.
 // Смешивание mmio (0x100) и legacy (0x12) было причиной мусорных readback.
-const REG_DEVICE_ID:      u16 = 0x00; // 32-бит, читаем
-const REG_VENDOR_ID:      u16 = 0x04; // 32-бит (младшие 16 = vendor)
-const REG_DEVICE_FEATURES: u16 = 0x04; // 32-бит
+const REG_DEVICE_FEATURES_LO: u16 = 0x00; // 32-бит, младшие фичи
+const REG_DEVICE_FEATURES_HI: u16 = 0x04; // 32-бит, старшие фичи
 const REG_DRIVER_FEATURES: u16 = 0x08; // 32-бит
 const REG_QUEUE_PFN:      u16 = 0x08; // 32-бит
 const REG_QUEUE_NUM:      u16 = 0x0C; // 16-бит!
 const REG_QUEUE_SEL:      u16 = 0x0E; // 16-бит
 const REG_QUEUE_NOTIFY:   u16 = 0x10; // 16-бит
 const REG_STATUS:         u16 = 0x12; // 8-бит!
-const REG_QUEUE_ENABLE:   u16 = 0x13; // 8-бит (в MMIO это был READY)
+const REG_ISR:            u16 = 0x13; // 8-бит, Interrupt Status (write-1-to-clear)
 const REG_MAC:            u16 = 0x14; // 6 байт, читаем по одному
 
 /// VIRTIO_NET_F_MAC (бит 5) — устройство сообщает MAC в конфигурации.
@@ -77,6 +76,8 @@ pub struct Virtqueue {
     qsize: usize,
     /// Физические адреса RX-буферов по индексу дескриптора (0 = не выделен).
     buf_phys: [u64; QUEUE_SIZE],
+    /// Следующий свободный дескриптор для TX.
+    next_tx: u16,
 }
 
 unsafe fn dbg_outb(port: u16, val: u8) {
@@ -98,8 +99,8 @@ pub unsafe fn start_device(io_base: u16) {
     // Legacy DeviceID по +0x00 = 0x554d4551 ("QEMU"). MAC лежит шестью
     // байтами по +0x14..+0x19. Если MAC читается верно, порты и BAR
     // заведомо рабочие, и дальше можно верить остальным readback.
-    let did = inl(io_base + REG_DEVICE_ID);
-    dbg_str(&alloc::format!("[virtio] legacy DeviceID = {:#x} (want 0x554d4551)\n", did));
+    let feat_lo0 = inl(io_base + REG_DEVICE_FEATURES_LO);
+    dbg_str(&alloc::format!("[virtio] host features lo = {:#x}\n", feat_lo0));
     let m0 = inb(io_base + REG_MAC + 0);
     let m1 = inb(io_base + REG_MAC + 1);
     let m2 = inb(io_base + REG_MAC + 2);
@@ -122,16 +123,23 @@ pub unsafe fn start_device(io_base: u16) {
     let s = inb(io_base + REG_STATUS);
     dbg_str(&alloc::format!("[virtio] status after DRIVER     = {:#04x} (want 0x03)\n", s));
 
-    // Фичи: забираем у устройства и оставляем только MAC (бит 5).
-    // Никаких VIRTIO_F_VERSION_1 / MRG_RXBUF / GSO — под них кода нет.
-    let device_features = inl(io_base + REG_DEVICE_FEATURES);
+    // Фичи устройства 64-битные: младшие 32 по +0x00, старшие 32 по +0x04.
+    // Раньше читалось только +0x04, то есть старшая половина (у legacy-устройства
+    // она 0), и мы писали в GuestFeatures нули, не согласуя даже VIRTIO_NET_F_MAC.
+    // GuestFeatures пишется по +0x08.
+    let feat_lo = inl(io_base + REG_DEVICE_FEATURES_LO);
+    let feat_hi = inl(io_base + REG_DEVICE_FEATURES_HI);
+
+    // Оставляем только то, что реально поддерживаем: VIRTIO_NET_F_MAC.
+    // VERSION_1 (бит 32, в старшей половине) нам недоступен и не нужен —
+    // драйвер говорит на legacy-раскладке колец.
     let mut driver_features = 0u32;
-    if device_features & VIRTIO_NET_F_MAC != 0 {
+    if feat_lo & VIRTIO_NET_F_MAC != 0 {
         driver_features |= VIRTIO_NET_F_MAC;
     }
     outl(io_base + REG_DRIVER_FEATURES, driver_features);
-    dbg_str(&alloc::format!("[virtio] features dev={:#x} drv={:#x}\n",
-        device_features, driver_features));
+    dbg_str(&alloc::format!("[virtio] features lo={:#x} hi={:#x} drv={:#x} (has MAC={})\n",
+        feat_lo, feat_hi, driver_features, feat_lo & VIRTIO_NET_F_MAC != 0));
 
     dbg_str("[virtio] driver init done\n");
 }
@@ -190,9 +198,25 @@ impl Virtqueue {
         let avail = ptr.add(desc_bytes) as *mut VirtqAvail;
         let used  = ptr.add(used_offset) as *mut VirtqUsed;
 
-        for i in 0..qsize - 1 {
-            (*desc.add(i)).next  = (i + 1) as u16;
-            (*desc.add(i)).flags = 1;
+        // DMA-память приходит из buddy грязной: без обнуления avail.idx и
+        // used.idx содержат мусор, и устройство читает несуществующие дескрипторы.
+        for i in 0..total {
+            core::ptr::write_volatile(ptr.add(i), 0u8);
+        }
+        fence(Ordering::Release);
+
+        // НЕ связываем дескрипторы в цепочку (flags=1 / NEXT). Так делают для
+        // scatter-gather, но здесь каждый буфер самостоятельный, и устройство,
+        // следуя NEXT, уходило в неинициализированные дескрипторы — QEMU
+        // отвечал "bogus descriptor or out of resources" и
+        // "receive queue contains no in buffers".
+        // Для TX свободные дескрипторы берутся из free_head, который
+        // инициализируется отдельно в send().
+        for i in 0..qsize {
+            (*desc.add(i)).next  = 0;
+            (*desc.add(i)).flags = 0;
+            (*desc.add(i)).addr  = 0;
+            (*desc.add(i)).len   = 0;
         }
 
         dbg_str("[virtio] QUEUE_PFN\n");
@@ -203,17 +227,12 @@ impl Virtqueue {
         // плавающую шину, то есть устройство по этому BAR не отвечает вовсе.
         let pfn_rb = inl(io_base + REG_QUEUE_PFN);
         let num_rb = inw(io_base + REG_QUEUE_NUM);
-        // Legacy: очередь надо ЯВНО разрешить записью 1 в QUEUE_ENABLE (+0x13),
-        // иначе устройство не обрабатывает её вовсе. Раньше этот регистр
-        // только читался и оставался 0 — кольцо игнорировалось.
-        outb(io_base + REG_QUEUE_ENABLE, 1);
-        let en_rb = inb(io_base + REG_QUEUE_ENABLE);
-        dbg_str(&alloc::format!("[virtio] q{} readback PFN={:#x} (wrote {:#x}) NUM={} ENABLE={}\n",
-            queue_idx, pfn_rb, (ptr_phys as u64 / 4096) as u32, num_rb, en_rb));
+        dbg_str(&alloc::format!("[virtio] q{} readback PFN={:#x} (wrote {:#x}) NUM={}\n",
+            queue_idx, pfn_rb, (ptr_phys as u64 / 4096) as u32, num_rb));
 
         dbg_str("[virtio] init done\n");
 
-        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, next_post: 0, qsize, buf_phys: [0u64; QUEUE_SIZE] };
+        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, next_post: 0, qsize, buf_phys: [0u64; QUEUE_SIZE], next_tx: 0 };
         // Для RX-очереди дескрипторы должны быть опубликованы в avail ring:
         // иначе у устройства нет ни одного буфера, куда писать, used.idx
         // никогда не растёт и recv() всегда возвращает None.
@@ -222,6 +241,9 @@ impl Virtqueue {
         if queue_idx == 0 {
             q.post_receive_buffers(BUF_COUNT);
         }
+        // Диагностика: что реально лежит в кольцах сразу после инициализации.
+        dbg_str(&alloc::format!("[virtio] q{} memcheck avail@{:p} used@{:p} avail.idx={} avail.ring[0]={} used.idx={}\n",
+            queue_idx, q.avail, q.used, (*q.avail).idx, (*q.avail).ring[0], (*q.used).idx));
         q
     }
 
@@ -249,7 +271,10 @@ impl Virtqueue {
 
             (*self.desc.add(idx)).addr  = buf_phys;
             (*self.desc.add(idx)).len   = BUF_SIZE as u32;
-            (*self.desc.add(idx)).flags = 0; // WRITE: устройство пишет в буфер
+            // VRING_DESC_F_WRITE = 1: устройство пишет в этот буфер.
+            // flags = 0 означало бы, что устройство только ЧИТАЕТ дескриптор,
+            // и RX-очередь оставалась пустой (used.idx не рос).
+            (*self.desc.add(idx)).flags = 1;
             (*self.desc.add(idx)).next  = 0;
 
             let avail_idx = (*self.avail).idx as usize % self.qsize;
@@ -280,8 +305,11 @@ impl Virtqueue {
         }
         core::ptr::copy_nonoverlapping(data.as_ptr(), d.add(VIRTIO_NET_HDR_LEN), data.len());
 
-        let idx = self.free_head as usize;
-        self.free_head = (*self.desc.add(idx)).next;
+        // Свободный дескриптор для TX берём по счётчику: поле `next` больше не
+        // используется как free-list (дескрипторы не связаны в цепочку).
+        let idx = self.next_tx as usize;
+        if idx >= self.qsize { return; }
+        self.next_tx += 1;
 
         (*self.desc.add(idx)).addr  = dphys;
         (*self.desc.add(idx)).len   = total as u32;
@@ -296,8 +324,30 @@ impl Virtqueue {
         outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
     }
 
+    /// Периодическая диагностика состояния RX-кольца.
+    pub unsafe fn dump_rx_state(&self, tag: &str) {
+        fence(Ordering::Acquire);
+        let a_idx = core::ptr::read_volatile(&(*self.avail).idx);
+        let a_flg = core::ptr::read_volatile(&(*self.avail).flags);
+        let u_idx = core::ptr::read_volatile(&(*self.used).idx);
+        let u_flg = core::ptr::read_volatile(&(*self.used).flags);
+        let u_id = core::ptr::read_volatile(&(*self.used).ring[0].id);
+        let u_len = core::ptr::read_volatile(&(*self.used).ring[0].len);
+        let d_addr = core::ptr::read_volatile(&(*self.desc).addr);
+        let d_len = core::ptr::read_volatile(&(*self.desc).len);
+        let d_flg = core::ptr::read_volatile(&(*self.desc).flags);
+        let a0 = core::ptr::read_volatile(&(*self.avail).ring[0]);
+        dbg_str(&alloc::format!("[virtio]   RAW used.ring[0]={{id:{} len:{}}} desc[0]={{addr:{:#x} len:{} flags:{}}} avail.ring[0]={}\n",
+            u_id, u_len, d_addr, d_len, d_flg, a0));
+        dbg_str(&alloc::format!(
+            "[virtio] RX {}: avail.idx={} avail.flags={} used.idx={} used.flags={} last_used={} isr={:#x}\n",
+            tag, a_idx, a_flg, u_idx, u_flg, self.last_used, inb(self.io_base + REG_ISR)));
+    }
+
     pub unsafe fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
-        if (*self.used).idx == self.last_used { return None; }
+        fence(Ordering::Acquire);
+        let used_idx = core::ptr::read_volatile(&(*self.used).idx);
+        if used_idx == self.last_used { return None; }
 
         // Диагностика: устройство наконец-то что-то отдало.
         dbg_str(&alloc::format!("[virtio] q{} used.idx={} last_used={}\n",
@@ -323,7 +373,7 @@ impl Virtqueue {
         // post_receive_buffers(1) — он оказывался в avail дважды.
         (*self.desc.add(did)).addr  = phys;
         (*self.desc.add(did)).len   = BUF_SIZE as u32;
-        (*self.desc.add(did)).flags = 0; // WRITE
+        (*self.desc.add(did)).flags = 1; // VRING_DESC_F_WRITE
         let avail_idx = (*self.avail).idx as usize % self.qsize;
         (*self.avail).ring[avail_idx] = did as u16;
         fence(Ordering::Release);
