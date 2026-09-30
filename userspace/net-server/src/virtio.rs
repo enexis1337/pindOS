@@ -87,6 +87,11 @@ pub unsafe fn start_device(io_base: u16) {
     outl(io_base + VIRTIO_MMIO_STATUS, STATUS_ACKNOWLEDGE);
     outl(io_base + VIRTIO_MMIO_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
+    // Диагностика: читаем статус обратно. Ожидаем 0x03; 0xff означает, что
+    // порт не отвечает и мы обращаемся не туда.
+    let st = inl(io_base + VIRTIO_MMIO_STATUS);
+    dbg_str(&alloc::format!("[virtio] status readback after DRIVER = {:#x} (want 0x3)\n", st));
+
     // Запрашиваем у устройства набор фич и оставляем только те, что реально
     // поддерживаем: только VIRTIO_NET_F_MAC (устройство сообщит MAC сам).
     // Никаких VIRTIO_F_VERSION_1 / MRG_RXBUF / GSO: под них у нас нет кода.
@@ -103,6 +108,8 @@ pub unsafe fn start_device(io_base: u16) {
 pub unsafe fn finish_device(io_base: u16) {
     outl(io_base + VIRTIO_MMIO_STATUS,
          STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
+    let st = inl(io_base + VIRTIO_MMIO_STATUS);
+    dbg_str(&alloc::format!("[virtio] status readback after DRIVER_OK = {:#x} (want 0x7)\n", st));
     dbg_str("[virtio] DRIVER_OK\n");
 }
 

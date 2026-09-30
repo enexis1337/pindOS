@@ -17,7 +17,17 @@ pub fn find_virtio_net() -> Option<PciDevice> {
         for slot in 0u8..32 {
             let vendor_device = pci_read32(bus, slot, 0, 0);
             if vendor_device == 0x1000_1AF4 {
-                let bar0 = pci_read32(bus, slot, 0, 0x10) & !0xF;
+                // Диагностика: печатаем сырые BAR0 и Command до любых правок.
+                let bar0_raw = pci_read32(bus, slot, 0, 0x10);
+                let cmd_raw = pci_read32(bus, slot, 0, 0x04);
+                let cmd = (cmd_raw >> 16) & 0xFFFF;
+                println!("[pci] found 1af4:1000 at bus={} slot={}", bus, slot);
+                println!("[pci]   BAR0 raw = {:#010x}", bar0_raw);
+                println!("[pci]   CMD  raw = {:#010x} status={:#06x} command={:#06x}",
+                    cmd_raw, cmd_raw >> 16, cmd);
+                println!("[pci]   I/O space (cmd bit0) = {}", cmd & 1);
+                println!("[pci]   bus master  (cmd bit2) = {}", (cmd >> 2) & 1);
+                let bar0 = bar0_raw & !0xF;
                 return Some(PciDevice { bus, slot, bar0: bar0 as u16 });
             }
         }
