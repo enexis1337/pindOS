@@ -3,12 +3,26 @@ use alloc::alloc::{alloc_zeroed, Layout};
 
 const QUEUE_SIZE: usize = 256;
 /// Размер одного буфера приёма ( jumbo Ethernet-кадр с запасом ).
-const BUF_SIZE: usize = 2048;
+/// Размер virtio_net_hdr для legacy virtio-net без VIRTIO_NET_F_MRG_RXBUF:
+/// flags(1) + gso_type(1) + hdr_len(2) + gso_size(2) + csum_start(2) +
+/// csum_offset(2) = 10 байт. Устройство пишет этот заголовок в начало каждого
+/// принятого буфера, поэтому smoltcp должен получить данные ПОСЛЕ него.
+pub const VIRTIO_NET_HDR_LEN: usize = 10;
+
+/// Максимальный Ethernet-кадр, который нам нужно принять.
+pub const MAX_FRAME: usize = 1514;
+
+/// RX-буфер обязан вмещать заголовок плюс кадр.
+pub const BUF_SIZE: usize = VIRTIO_NET_HDR_LEN + MAX_FRAME;
 /// Сколько буферов публикуем в RX-очередь при инициализации.
 const BUF_COUNT: usize = 32;
 
 // Регистры legacy virtio-pci (MMIO BAR0, как у QEMU по умолчанию).
 const VIRTIO_MMIO_STATUS:  u16 = 0x100;
+const VIRTIO_MMIO_DEVICE_FEATURES: u16 = 0x104;
+const VIRTIO_MMIO_DRIVER_FEATURES: u16 = 0x120;
+/// VIRTIO_NET_F_MAC (бит 5) — устройство сообщает MAC в конфигурации.
+const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 const STATUS_ACKNOWLEDGE: u32 = 1;
 const STATUS_DRIVER:     u32 = 2;
 const STATUS_DRIVER_OK:  u32 = 4;
@@ -72,7 +86,16 @@ pub unsafe fn start_device(io_base: u16) {
     outl(io_base + VIRTIO_MMIO_STATUS, 0);
     outl(io_base + VIRTIO_MMIO_STATUS, STATUS_ACKNOWLEDGE);
     outl(io_base + VIRTIO_MMIO_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
-    // Никаких фич не запрашиваем: legacy virtio-net без VIRTIO_F_VERSION_1.
+
+    // Запрашиваем у устройства набор фич и оставляем только те, что реально
+    // поддерживаем: только VIRTIO_NET_F_MAC (устройство сообщит MAC сам).
+    // Никаких VIRTIO_F_VERSION_1 / MRG_RXBUF / GSO: под них у нас нет кода.
+    let device_features = inl(io_base + VIRTIO_MMIO_DEVICE_FEATURES);
+    let driver_features = device_features & VIRTIO_NET_F_MAC;
+    outl(io_base + VIRTIO_MMIO_DRIVER_FEATURES, driver_features);
+    dbg_str(&alloc::format!("[virtio] features dev={:#x} drv={:#x}\n",
+        device_features, driver_features));
+
     dbg_str("[virtio] driver init done\n");
 }
 
@@ -142,7 +165,11 @@ impl Virtqueue {
         // Для RX-очереди дескрипторы должны быть опубликованы в avail ring:
         // иначе у устройства нет ни одного буфера, куда писать, used.idx
         // никогда не растёт и recv() всегда возвращает None.
-        q.post_receive_buffers(BUF_COUNT);
+        // Буферы приёма публикуются только в очереди 0. У TX-очереди их быть
+        // не должно: лишние WRITE-дескрипторы там бессмысленны.
+        if queue_idx == 0 {
+            q.post_receive_buffers(BUF_COUNT);
+        }
         q
     }
 
@@ -187,17 +214,25 @@ impl Virtqueue {
         }
     }
 
+    /// Отправляет Ethernet-кадр. Данные уже без заголовков L2/L3/L4 —
+    /// добавляется только virtio_net_hdr, который smoltcp не знает.
     pub unsafe fn send(&mut self, data: &[u8]) {
-        // Данные копируем в DMA-буфер: дескриптору отдаётся физический адрес.
-        let (dvirt, dphys) = dma_alloc_pages((data.len() + 4095) / 4096);
+        let total = VIRTIO_NET_HDR_LEN + data.len();
+        let (dvirt, dphys) = dma_alloc_pages((total + 4095) / 4096);
         if dvirt == 0 { return; }
-        core::ptr::copy_nonoverlapping(data.as_ptr(), dvirt as *mut u8, data.len());
+        // Заголовок нулевой: без GSO и без пересчёта контрольной суммы
+        // устройство берёт контрольные суммы из заголовков L4.
+        let d = dvirt as *mut u8;
+        for i in 0..VIRTIO_NET_HDR_LEN {
+            core::ptr::write_volatile(d.add(i), 0u8);
+        }
+        core::ptr::copy_nonoverlapping(data.as_ptr(), d.add(VIRTIO_NET_HDR_LEN), data.len());
 
         let idx = self.free_head as usize;
         self.free_head = (*self.desc.add(idx)).next;
 
         (*self.desc.add(idx)).addr  = dphys;
-        (*self.desc.add(idx)).len   = data.len() as u32;
+        (*self.desc.add(idx)).len   = total as u32;
         (*self.desc.add(idx)).flags = 0;
 
         let avail_idx = (*self.avail).idx as usize % self.qsize;
@@ -216,19 +251,29 @@ impl Virtqueue {
         let did = elem.id as usize;
         let phys = self.buf_phys[did];
         if phys == 0 { return None; }
-        // Данные лежат в DMA-буфере, доступном нам как userspace-виртуальная
-        // память по тому же адресу (ядро замапило phys по выданному virt).
-        let len  = (elem.len as usize).min(buf.len());
 
-        core::ptr::copy_nonoverlapping(phys as *const u8, buf.as_mut_ptr(), len);
+        // Устройство кладёт в буфер virtio_net_hdr (10 байт) перед кадром.
+        // smoltcp о нём не знает, поэтому пропускаем и отдаём только Ethernet.
+        let raw = elem.len as usize;
+        if raw <= VIRTIO_NET_HDR_LEN { return None; }
+        let frame = &*(phys as *const u8).add(VIRTIO_NET_HDR_LEN);
+        let len = (raw - VIRTIO_NET_HDR_LEN).min(buf.len());
+
+        core::ptr::copy_nonoverlapping(frame, buf.as_mut_ptr(), len);
         self.last_used = self.last_used.wrapping_add(1);
 
-        (*self.desc.add(did)).next = self.free_head;
-        self.free_head = elem.id as u16;
-
-        // Буфер надо вернуть устройству: без этого RX-очередь опустеет и
-        // через несколько пакетов перестанет получать что-либо.
-        self.post_receive_buffers(1);
+        // Буфер возвращаем устройству на ТОТ ЖЕ дескриптор. Раньше дескриптор
+        // сначала возвращался в free-list, а потом публиковался заново
+        // post_receive_buffers(1) — он оказывался в avail дважды.
+        (*self.desc.add(did)).addr  = phys;
+        (*self.desc.add(did)).len   = BUF_SIZE as u32;
+        (*self.desc.add(did)).flags = 0; // WRITE
+        let avail_idx = (*self.avail).idx as usize % self.qsize;
+        (*self.avail).ring[avail_idx] = did as u16;
+        fence(Ordering::Release);
+        (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
+        fence(Ordering::Release);
+        outw(self.io_base + 16, self.queue_idx);
 
         Some(len)
     }
@@ -272,6 +317,12 @@ const fn align_up(v: usize, align: usize) -> usize {
 unsafe fn inw(port: u16) -> u16 {
     let v: u16;
     core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nostack));
+    v
+}
+
+unsafe fn inl(port: u16) -> u32 {
+    let v: u32;
+    core::arch::asm!("in eax, dx", out("eax") v, in("dx") port, options(nostack));
     v
 }
 
