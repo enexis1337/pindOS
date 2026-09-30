@@ -33,6 +33,12 @@ const REG_MAC:            u16 = 0x14; // 6 байт, читаем по одно�
 
 /// VIRTIO_NET_F_MAC (бит 5) — устройство сообщает MAC в конфигурации.
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+
+// Флаги дескриптора vring. Значения заданы спецификацией virtio:
+// NEXT = 1, WRITE = 2. Раньше для RX стояло flags = 1, то есть NEXT, а не
+// WRITE: устройство пыталось идти по цепочке и падало с "Looped descriptor".
+const VRING_DESC_F_NEXT:  u16 = 1;
+const VRING_DESC_F_WRITE: u16 = 2;
 const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER:     u8 = 2;
 const STATUS_DRIVER_OK:  u8 = 4;
@@ -284,10 +290,10 @@ impl Virtqueue {
 
             (*self.desc.add(idx)).addr  = buf_phys;
             (*self.desc.add(idx)).len   = BUF_SIZE as u32;
-            // VRING_DESC_F_WRITE = 1: устройство пишет в этот буфер.
-            // flags = 0 означало бы, что устройство только ЧИТАЕТ дескриптор,
-            // и RX-очередь оставалась пустой (used.idx не рос).
-            (*self.desc.add(idx)).flags = 1;
+            // WRITE: устройство пишет в этот буфер. NEXT НЕ выставляем —
+            // иначе устройство идёт по цепочке (ошибка "Looped descriptor").
+            (*self.desc.add(idx)).flags = VRING_DESC_F_WRITE;
+            (*self.desc.add(idx)).next  = 0;
             (*self.desc.add(idx)).next  = 0;
 
             let avail_idx = (*self.avail).idx as usize % self.qsize;
@@ -302,6 +308,22 @@ impl Virtqueue {
             // Сообщаем устройству, что буферы появились.
             outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
         }
+    }
+
+    /// Возвращает уже использованный дескриптор в avail с тем же буфером.
+    /// Единая точка публикации RX-буферов: используется и при инициализации
+    /// (через post_receive_buffers), и после каждого recv.
+    pub unsafe fn repost_descriptor(&mut self, did: usize, phys: u64) {
+        (*self.desc.add(did)).addr  = phys;
+        (*self.desc.add(did)).len   = BUF_SIZE as u32;
+        (*self.desc.add(did)).flags = VRING_DESC_F_WRITE; // устройство пишет
+        (*self.desc.add(did)).next  = 0;                  // без цепочки
+        let avail_idx = (*self.avail).idx as usize % self.qsize;
+        (*self.avail).ring[avail_idx] = did as u16;
+        fence(Ordering::Release);
+        (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
+        fence(Ordering::Release);
+        outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
     }
 
     /// Отправляет Ethernet-кадр. Данные уже без заголовков L2/L3/L4 —
@@ -326,7 +348,7 @@ impl Virtqueue {
 
         (*self.desc.add(idx)).addr  = dphys;
         (*self.desc.add(idx)).len   = total as u32;
-        (*self.desc.add(idx)).flags = 0;
+        (*self.desc.add(idx)).flags = 0; // TX: устройство читает, WRITE не нужен
 
         let avail_idx = (*self.avail).idx as usize % self.qsize;
         (*self.avail).ring[avail_idx] = idx as u16;
@@ -350,7 +372,7 @@ impl Virtqueue {
         let d_len = core::ptr::read_volatile(&(*self.desc).len);
         let d_flg = core::ptr::read_volatile(&(*self.desc).flags);
         let a0 = core::ptr::read_volatile(&(*self.avail).ring[0]);
-        dbg_str(&alloc::format!("[virtio]   RAW used.ring[0]={{id:{} len:{}}} desc[0]={{addr:{:#x} len:{} flags:{}}} avail.ring[0]={}\n",
+        dbg_str(&alloc::format!("[virtio]   RAW used.ring[0]={{id:{} len:{}}} desc[0]={{addr:{:#x} len:{} flags:{:#x}}} avail.ring[0]={}\n",
             u_id, u_len, d_addr, d_len, d_flg, a0));
         // Status читаем отдельно: 0x47 означает NEEDS_RESET (бит 0x40),
         // то есть устройство само отказалось от нашего драйвера.
@@ -386,18 +408,9 @@ impl Virtqueue {
         core::ptr::copy_nonoverlapping(frame, buf.as_mut_ptr(), len);
         self.last_used = self.last_used.wrapping_add(1);
 
-        // Буфер возвращаем устройству на ТОТ ЖЕ дескриптор. Раньше дескриптор
-        // сначала возвращался в free-list, а потом публиковался заново
-        // post_receive_buffers(1) — он оказывался в avail дважды.
-        (*self.desc.add(did)).addr  = phys;
-        (*self.desc.add(did)).len   = BUF_SIZE as u32;
-        (*self.desc.add(did)).flags = 1; // VRING_DESC_F_WRITE
-        let avail_idx = (*self.avail).idx as usize % self.qsize;
-        (*self.avail).ring[avail_idx] = did as u16;
-        fence(Ordering::Release);
-        (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
-        fence(Ordering::Release);
-        outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
+        // Буфер возвращаем ТЕМ ЖЕ путём, что и при инициализации: через
+        // repost_descriptor. Иначе через BUF_COUNT кадров приём встал бы.
+        self.repost_descriptor(did, phys);
 
         Some(len)
     }
