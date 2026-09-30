@@ -83,6 +83,7 @@ mod virtio;
 use alloc::vec;
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
+    socket::udp,
     time::Instant,
     wire::{EthernetAddress, IpCidr, Ipv4Address},
 };
@@ -121,17 +122,27 @@ fn main() -> i32 {
     };
 
     // 2. Инициализировать RX и TX очереди
+    // Handshake с устройством — один раз, до настройки очередей.
+    unsafe { virtio::start_device(pci_dev.bar0) };
+
     dbg_str("[main] init rx_queue\n");
     let rx_queue = unsafe { virtio::Virtqueue::init(pci_dev.bar0, 0) };
     dbg_str("[main] init tx_queue\n");
     let tx_queue = unsafe { virtio::Virtqueue::init(pci_dev.bar0, 1) };
     dbg_str("[main] queues done\n");
+    // Обе очереди готовы и буферы опубликованы — можно разрешить работу.
+    unsafe { virtio::finish_device(pci_dev.bar0) };
 
     // 3. Создать Device wrapper для smoltcp
     let mut device = device::VirtioNetDevice {
         rx_queue,
         tx_queue,
         rx_buf: [0u8; 1514],
+        arp_req_tx: 0,
+        arp_reply_rx: 0,
+        arp_request_rx: 0,
+        frames_rx: 0,
+        frames_tx: 0,
     };
     dbg_str("[main] device created\n");
 
@@ -154,20 +165,63 @@ fn main() -> i32 {
     let mac = EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
     let config = Config::new(mac.into());
     let mut iface = Interface::new(config, &mut device, Instant::ZERO);
+
+    // Адреса QEMU user-net (SLIRP): гость 10.0.2.15/24, шлюз 10.0.2.2.
+    // Прежний адрес 10.0.2.2 совпадал с адресом шлюза, поэтому ARP-запрос
+    // уходил самому себе и ответа не было.
+    let guest_ip = Ipv4Address::new(10, 0, 2, 15);
+    let gateway  = Ipv4Address::new(10, 0, 2, 2);
     iface.update_ip_addrs(|addr_list| {
-        addr_list.push(IpCidr::new(Ipv4Address::new(10, 0, 0, 2).into(), 24)).ok();
+        addr_list.push(IpCidr::new(guest_ip.into(), 24)).ok();
     });
+    match iface.routes_mut().add_default_ipv4_route(gateway) {
+        Ok(_) => println!("[net-server] default route via {}", gateway),
+        Err(e) => println!("[net-server] ERROR: cannot add default route: {:?}", e),
+    }
+    println!("[net-server] ip={}/24 gw={}", guest_ip, gateway);
+
+    let udp_rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 2048]);
+    let udp_tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]);
+    let mut udp_sock = udp::Socket::new(udp_rx, udp_tx);
+    udp_sock
+        .bind(1234)
+        .map_err(|e| println!("[net-server] udp bind failed: {:?}", e))
+        .ok();
+
+    // Сокет обязан быть в SocketSet, иначе poll() его не опрашивает и никакого
+    // исходящего трафика (а значит, и ARP-резолвинга) не будет. handle нужен,
+    // чтобы потом достать сокет обратно для send().
     let mut sockets = SocketSet::new(vec![]);
+    let udp_handle = sockets.add(udp_sock);
 
     // 6. Event loop
     println!("[net-server] entering main event loop");
     let mut idle_polls: u64 = 0;
+    let mut iface_routes_ready = false;
     loop {
         // Настоящее монотонное время вместо счётчика итераций: smoltcp
         // сравнивает timestamps с таймаутами сокетов, и растущий счётчик
         // вёл себя как часы с произвольной скоростью.
         let now = Instant::from_millis(sys_time() as i64);
         iface.poll(now, &mut device, &mut sockets);
+
+        // smoltcp не начинает ARP-резолвинг, пока некуда отправлять пакет.
+        // Периодически шлём UDP на шлюз: это заставляет интерфейс искать его
+        // MAC через ARP (и, transitively, даёт трафик для 5d).
+        if idle_polls % 500 == 0 {
+            match sockets.get_mut::<udp::Socket>(udp_handle).send(1, (gateway, 9)) {
+                Ok(buf) => buf[0] = 0xAA,
+                Err(e) => {
+                    if idle_polls % 2000 == 0 {
+                        println!("[net-server] gateway probe error: {:?}, frames tx={} rx={}", e, device.frames_tx, device.frames_rx);
+                    }
+                }
+            }
+        }
+        if device.arp_reply_rx > 0 && !iface_routes_ready {
+            iface_routes_ready = true;
+            println!("[net-server] ARP resolved: gateway {} answered", gateway);
+        }
 
         // poll() ничего не отдал — не сжигаем квант, отдаём CPU соседям.
         // Иначе процесс, которому нечего обрабатывать, занимает квант
