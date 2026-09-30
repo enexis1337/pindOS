@@ -83,6 +83,15 @@ unsafe fn dbg_str(s: &str) {
 /// Без DRIVER_OK устройство остаётся в DRIVER_FAILS: TX-кольцо ещё кое-как
 /// работает, но RX не приходит никогда и used.idx не растёт.
 pub unsafe fn start_device(io_base: u16) {
+    // Диагностика: опрашиваем ключевые регистры до записи. У legacy
+    // virtio-pci DeviceID по смещению 0x00 равен 0x554d4551 ("QEMU").
+    // Если читается 0xffffffff, порт не декодируется вовсе.
+    let did = inl(io_base + 0x00);
+    let vid = inl(io_base + 0x04);
+    let st0 = inl(io_base + 0x100);
+    dbg_str(&alloc::format!("[virtio] probe io_base={:#x} DEVICE_ID={:#x} VENDOR_ID={:#x} STATUS={:#x}\n",
+        io_base, did, vid, st0));
+
     outl(io_base + VIRTIO_MMIO_STATUS, 0);
     outl(io_base + VIRTIO_MMIO_STATUS, STATUS_ACKNOWLEDGE);
     outl(io_base + VIRTIO_MMIO_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
@@ -165,6 +174,13 @@ impl Virtqueue {
         dbg_str("[virtio] QUEUE_PFN\n");
         // В QUEUE_PFN уходит ФИЗИЧЕСКИЙ адрес, не виртуальный.
         outl(io_base + 8,  (ptr_phys as u64 / 4096) as u32);
+
+        // Диагностика: читаем QUEUE_PFN и QUEUE_NUM back. 0xffffffff означает
+        // плавающую шину, то есть устройство по этому BAR не отвечает вовсе.
+        let pfn_rb = inl(io_base + 8);
+        let num_rb = inl(io_base + 12);
+        dbg_str(&alloc::format!("[virtio] q{} readback PFN={:#x} (wrote {:#x}) NUM={} READY={}\n",
+            queue_idx, pfn_rb, (ptr_phys as u64 / 4096) as u32, num_rb, inl(io_base + 18)));
 
         dbg_str("[virtio] init done\n");
 
@@ -253,6 +269,10 @@ impl Virtqueue {
 
     pub unsafe fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
         if (*self.used).idx == self.last_used { return None; }
+
+        // Диагностика: устройство наконец-то что-то отдало.
+        dbg_str(&alloc::format!("[virtio] q{} used.idx={} last_used={}\n",
+            self.queue_idx, (*self.used).idx, self.last_used));
 
         let elem = &(*self.used).ring[self.last_used as usize % self.qsize];
         let did = elem.id as usize;
