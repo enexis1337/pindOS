@@ -185,6 +185,7 @@ pub extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         2 => sys_exec(a0, a1),
         3 => sys_waitpid(a0, a1),
         4 => sys_time(),
+        5 => sys_dma_alloc(a0, a1),
         60 => sys_exit(a0 as i32),
         _ => -38,
     }
@@ -193,6 +194,125 @@ pub extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 fn sys_yield() -> i64 {
     kprintln!("[syscall] yield called");
     crate::sched::yield_now();
+    0
+}
+
+/// Записывает пару u64 в пользовательскую память, предварительно проверив,
+/// что адрес принадлежит адресному пространству процесса.
+fn write_u64_pair(
+    aspace: &crate::sched::task::AddressSpace,
+    out: u64,
+    a: u64,
+    b: u64,
+) -> Result<(), ()> {
+    // Страницы должны быть отображены и доступны на запись.
+    for page in [out, out + 8] {
+        match aspace.translate_flags(page) {
+            Some(f) if f.contains(crate::mm::PageFlags::WRITABLE) => {}
+            _ => return Err(()),
+        }
+    }
+    // SAFETY: адреса проверены выше как отображённые и записываемые.
+    unsafe {
+        *(out as *mut u64) = a;
+        *((out + 8) as *mut u64) = b;
+    }
+    Ok(())
+}
+
+/// dma_alloc(pages, out) — выделяет физически непрерывный блок памяти и
+/// мапит его в адресное пространство вызывающего процесса.
+///
+/// Нужен для DMA: virtio дескрипторы и QUEUE_PFN требуют ФИЗИЧЕСКИХ адресов,
+/// а userspace не identity mapped (ELF грузится на USER_BASE, страницы
+/// раскладываются по произвольным buddy-фреймам), поэтому передавать туда
+/// userspace-виртуальные адреса бессмысленно — устройство прочитает мусор.
+///
+/// Возвращает 0 при успехе и заполняет out[0] = virt, out[1] = phys.
+/// pages округляется вверх до степени двойки (порядка buddy).
+///
+/// TODO(capabilities): доступ к DMA-памяти должен выдаваться по capability
+/// `DmaMemory` с проверкой лимита. Сейчас любой процесс может запросить любой
+/// объём, проверки нет.
+fn sys_dma_alloc(pages: u64, out: u64) -> i64 {
+    const DMA_BASE: u64 = 0x0400_0000; // 64 МиB, выше userspace (0x08000000 стек)
+    const DMA_LIMIT: u64 = 0x0800_0000;
+    const PAGE: u64 = 0x1000;
+
+    if pages == 0 {
+        return -22;
+    }
+
+    // Порядок buddy по числу страниц.
+    let mut order = 0u8;
+    while (1u64 << order) < pages && order < crate::mm::physical::MAX_ORDER as u8 - 1 {
+        order += 1;
+    }
+    let order_pages = 1u64 << order;
+
+    kprintln!("[dma] request {} pages", pages);
+    // Виртуальное окно выдаётся подряд с bumping-счётчика: раньше virt всегда
+    // равнялся DMA_BASE, поэтому второй запрос упирался в уже занятую страницу
+    // и DMA-памяти хватало ровно на один блок.
+    static DMA_NEXT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(DMA_BASE);
+    // Слоты забираем подряд, без гонок за прорезервленное окно.
+    let virt = DMA_NEXT.fetch_add(order_pages * PAGE, Ordering::Relaxed);
+    if virt < DMA_BASE || virt + order_pages * PAGE > DMA_LIMIT {
+        DMA_NEXT.fetch_sub(order_pages * PAGE, Ordering::Relaxed);
+        return -12;
+    }
+
+    let frame = {
+        let mut allocator = crate::mm::PHYSICAL_ALLOCATOR.lock();
+        match allocator.allocate(order) {
+            Ok(f) => f,
+            Err(_) => return -12,
+        }
+    };
+
+    // Мапим в текущий (активный) адресное пространство процесса.
+    {
+        let mut allocator = crate::mm::PHYSICAL_ALLOCATOR.lock();
+        for i in 0..order_pages {
+            let target = crate::mm::PhysFrame::new(frame.start_address + i * PAGE);
+            // SAFETY: virt свободен (DMA_BASE вне userspace и ядра), фрейм только что выделен.
+            let res = unsafe {
+                crate::mm::map_page(
+                    virt + i * PAGE,
+                    target,
+                    // USER_ACCESSIBLE обязателен: процесс работает в ring 3 и
+                    // пишет в кольца очереди сам. Без этого бита первая же
+                    // запись в desc вызывает #PF и процесс зависает.
+                    crate::mm::PageFlags::PRESENT
+                        | crate::mm::PageFlags::WRITABLE
+                        | crate::mm::PageFlags::USER_ACCESSIBLE,
+                    &mut allocator,
+                )
+            };
+            if res.is_err() {
+                kprintln!("[dma] map_page failed at {:#x}", virt + i * PAGE);
+                return -12;
+            }
+        }
+    }
+
+    // Копируем пару (virt, phys) в пользовательский буфер.
+    let user = {
+        let current = match crate::sched::get_current_task() {
+            Some(t) => t,
+            None => return -1,
+        };
+        let aspace = current.address_space.lock();
+        match crate::arch::x86_64::syscall::write_u64_pair(&aspace, out, virt, frame.start_address) {
+            Ok(()) => (),
+            Err(_) => return -14,
+        }
+    };
+    let _ = user;
+
+    kprintln!("[dma] alloc {} pages (order {}): virt={:#x} phys={:#x}",
+        pages, order, virt, frame.start_address);
     0
 }
 
