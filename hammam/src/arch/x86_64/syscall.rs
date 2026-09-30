@@ -1,7 +1,7 @@
 use crate::kprintln;
 use crate::mm::userptr::validate_user_slice;
 use crate::sched::task::AddressSpace;
-use crate::process::{PROCESS_TABLE, CURRENT_PROCESS, next_pid, Process};
+use crate::process::{PROCESS_TABLE, next_pid, Process};
 use crate::vfs::VFS;
 use alloc::vec;
 
@@ -197,14 +197,21 @@ fn sys_yield() -> i64 {
 
 /// exit(code) — завершить процесс
 fn sys_exit(code: i32) -> i64 {
-    kprintln!("[syscall] exit({})", code);
-    if let Some(proc) = CURRENT_PROCESS.lock().as_ref() {
-        let pid = proc.pid;
+    // Умирающий процесс определяем по текущей ЗАДАЧЕ, а не по CURRENT_PROCESS:
+    // CURRENT_PROCESS заполняется один раз при загрузке ядра и навсегда указывает
+    // на PID 1, поэтому раньше exit() любого сервиса помечал зомбием dealduck, а
+    // его собственный pid оставался живым и waitpid никогда не срабатывал.
+    let task_pid: Option<u32> = crate::sched::get_current_task().map(|t| t.id.0 as u32);
+
+    kprintln!("[syscall] exit({}) pid={:?}", code, task_pid);
+
+    if let Some(pid) = task_pid {
         if let Some(p) = PROCESS_TABLE.lock().get(&pid) {
             p.exit_code.store(code, Ordering::Release);
             p.is_zombie.store(true, Ordering::Release);
         }
     }
+
     crate::sched::exit_current();
     unreachable!()
 }
