@@ -161,11 +161,51 @@ fn main() -> i32 {
 
     // 6. Event loop
     println!("[net-server] entering main event loop");
-    let mut poll_count: u64 = 0;
+    let mut idle_polls: u64 = 0;
     loop {
-        let timestamp = Instant::from_millis(poll_count as i64);
-        iface.poll(timestamp, &mut device, &mut sockets);
-        poll_count += 1;
+        // Настоящее монотонное время вместо счётчика итераций: smoltcp
+        // сравнивает timestamps с таймаутами сокетов, и растущий счётчик
+        // вёл себя как часы с произвольной скоростью.
+        let now = Instant::from_millis(sys_time() as i64);
+        iface.poll(now, &mut device, &mut sockets);
+
+        // poll() ничего не отдал — не сжигаем квант, отдаём CPU соседям.
+        // Иначе процесс, которому нечего обрабатывать, занимает квант
+        // целиком и dealduck ждёт следующего тика.
+        idle_polls += 1;
+        sys_yield();
+
+        if idle_polls % 2000 == 0 {
+            println!("[net-server] idle polls: {}", idle_polls);
+        }
+    }
+}
+
+/// Монотонное время в мс с загрузки (syscall 4).
+fn sys_time() -> u64 {
+    let ms: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 4u64,
+            lateout("rax") ms,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if ms < 0 { 0 } else { ms as u64 }
+}
+
+/// Отдать остаток кванта (syscall 0).
+fn sys_yield() {
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 0u64,
+            lateout("rax") _,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
     }
 }
 
