@@ -87,13 +87,25 @@ use smoltcp::{
     wire::{EthernetAddress, IpCidr, Ipv4Address},
 };
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    main();
+/// Завершение процесса через sys_exit(60).
+///
+/// Никогда не возвращает: ядро в `sys_exit` не даёт вернуться в userspace.
+fn sys_exit(code: i32) -> ! {
+    unsafe {
+        core::arch::asm!("syscall", in("rax") 60u64, in("rdi") code as u64, options(nostack));
+    }
+    // Страховка: если ядро всё же вернуло управление, крутимся тут, а не
+    // продолжаем работу в userspace с уже освобождённым состоянием.
     loop {}
 }
 
-fn main() {
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    sys_exit(main())
+}
+
+/// Код возврата попадёт в sys_exit, а dealduck увидит его через sys_waitpid.
+fn main() -> i32 {
     println!("[net-server] starting virtio-net driver...");
 
     // 1. Найти virtio-net устройство на PCI шине
@@ -104,7 +116,7 @@ fn main() {
         }
         None => {
             println!("[net-server] ERROR: virtio-net device not found!");
-            return;
+            return 1;
         }
     };
 
@@ -194,8 +206,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
         for &b in s {
             core::arch::asm!("out dx, al", in("dx") 0x3f8u16, in("al") b, options(nostack));
         }
-        // Then try sys_exit
-        core::arch::asm!("syscall", in("rax") 60u64, in("rdi") 1u64);
     }
-    loop {}
+    // 1 = код паники; dealduck различает его по waitpid и не перезапустит сервис.
+    sys_exit(1)
 }
