@@ -50,6 +50,8 @@ pub struct Virtqueue {
     next_post: u16,
     /// Размер очереди, прочитанный у устройства (QUEUE_SIZE, io_base+12).
     qsize: usize,
+    /// Физические адреса RX-буферов по индексу дескриптора (0 = не выделен).
+    buf_phys: [u64; QUEUE_SIZE],
 }
 
 unsafe fn dbg_outb(port: u16, val: u8) {
@@ -111,11 +113,15 @@ impl Virtqueue {
         dbg_str(&alloc::format!("[virtio] layout: desc={} avail={} used_off={:#x} total={}\n",
             desc_bytes, avail_bytes, used_offset, total));
 
-        dbg_str("[virtio] alloc_zeroed\n");
+        dbg_str("[virtio] dma_alloc\n");
 
-        let layout = Layout::from_size_align(total, 4096).expect("layout");
-        let ptr = alloc_zeroed(layout);
-        if ptr.is_null() { panic!("virtqueue alloc failed"); }
+        // Кольца очереди размещаются в физически непрерывной памяти, выданной
+        // ядром: userspace-виртуальные адреса устройство использовать не может.
+        let (ptr_virt, ptr_phys) = dma_alloc_pages((total + 4095) / 4096);
+
+        let ptr = ptr_virt as *mut u8;
+        dbg_str(&alloc::format!("[virtio] queue mem virt={:#x} phys={:#x}\n", ptr_virt, ptr_phys));
+        if ptr_virt == 0 || ptr_phys == 0 { panic!("dma_alloc for queue failed"); }
 
         let desc  = ptr as *mut VirtqDesc;
         let avail = ptr.add(desc_bytes) as *mut VirtqAvail;
@@ -127,11 +133,12 @@ impl Virtqueue {
         }
 
         dbg_str("[virtio] QUEUE_PFN\n");
-        outl(io_base + 8,  (ptr as u32) / 4096);
+        // В QUEUE_PFN уходит ФИЗИЧЕСКИЙ адрес, не виртуальный.
+        outl(io_base + 8,  (ptr_phys as u64 / 4096) as u32);
 
         dbg_str("[virtio] init done\n");
 
-        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, next_post: 0, qsize };
+        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, next_post: 0, qsize, buf_phys: [0u64; QUEUE_SIZE] };
         // Для RX-очереди дескрипторы должны быть опубликованы в avail ring:
         // иначе у устройства нет ни одного буфера, куда писать, used.idx
         // никогда не растёт и recv() всегда возвращает None.
@@ -152,11 +159,16 @@ impl Virtqueue {
             if idx >= self.qsize - 1 { break; }
             self.next_post += 1;
 
-            let layout = match Layout::from_size_align(BUF_SIZE, 4096) { Ok(l) => l, Err(_) => break };
-            let buf = alloc_zeroed(layout);
-            if buf.is_null() { break; }
+            // Буфер приёма — тоже физическая память из ядра: virtio пишет
+            // кадр напрямую по физическому адресу из дескриптора.
+            let (buf_virt, buf_phys) = dma_alloc_pages((BUF_SIZE + 4095) / 4096);
+            if buf_virt == 0 { break; }
 
-            (*self.desc.add(idx)).addr  = buf as u64;
+            // Физический адрес буфера запоминаем по индексу дескриптора:
+            // в recv() нам нужно копировать данные именно из него.
+            self.buf_phys[idx] = buf_phys;
+
+            (*self.desc.add(idx)).addr  = buf_phys;
             (*self.desc.add(idx)).len   = BUF_SIZE as u32;
             (*self.desc.add(idx)).flags = 0; // WRITE: устройство пишет в буфер
             (*self.desc.add(idx)).next  = 0;
@@ -176,10 +188,15 @@ impl Virtqueue {
     }
 
     pub unsafe fn send(&mut self, data: &[u8]) {
+        // Данные копируем в DMA-буфер: дескриптору отдаётся физический адрес.
+        let (dvirt, dphys) = dma_alloc_pages((data.len() + 4095) / 4096);
+        if dvirt == 0 { return; }
+        core::ptr::copy_nonoverlapping(data.as_ptr(), dvirt as *mut u8, data.len());
+
         let idx = self.free_head as usize;
         self.free_head = (*self.desc.add(idx)).next;
 
-        (*self.desc.add(idx)).addr  = data.as_ptr() as u64;
+        (*self.desc.add(idx)).addr  = dphys;
         (*self.desc.add(idx)).len   = data.len() as u32;
         (*self.desc.add(idx)).flags = 0;
 
@@ -196,13 +213,17 @@ impl Virtqueue {
         if (*self.used).idx == self.last_used { return None; }
 
         let elem = &(*self.used).ring[self.last_used as usize % self.qsize];
-        let desc = &*self.desc.add(elem.id as usize);
+        let did = elem.id as usize;
+        let phys = self.buf_phys[did];
+        if phys == 0 { return None; }
+        // Данные лежат в DMA-буфере, доступном нам как userspace-виртуальная
+        // память по тому же адресу (ядро замапило phys по выданному virt).
         let len  = (elem.len as usize).min(buf.len());
 
-        core::ptr::copy_nonoverlapping(desc.addr as *const u8, buf.as_mut_ptr(), len);
+        core::ptr::copy_nonoverlapping(phys as *const u8, buf.as_mut_ptr(), len);
         self.last_used = self.last_used.wrapping_add(1);
 
-        (*self.desc.add(elem.id as usize)).next = self.free_head;
+        (*self.desc.add(did)).next = self.free_head;
         self.free_head = elem.id as u16;
 
         // Буфер надо вернуть устройству: без этого RX-очередь опустеет и
@@ -211,6 +232,36 @@ impl Virtqueue {
 
         Some(len)
     }
+}
+
+/// Выделяет через ядро физически непрерывный блок в `pages` страниц.
+/// Возвращает (virt, phys); (0, 0) при ошибке.
+///
+/// Ядро мапит физические фреймы в наше адресное пространство, поэтому по
+/// virt-адресу память тоже доступна — но в дескрипторы идёт phys.
+///
+/// TODO(capabilities): выдача DMA-памяти должна проверять capability
+/// `DmaMemory`; сейчас проверки в ядре нет (см. syscall::sys_dma_alloc).
+pub fn dma_alloc_pages(pages: usize) -> (u64, u64) {
+    // out-буфер для пары (virt, phys) кладём на стек.
+    let mut out = [0u64; 2];
+    let rc: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 5u64,
+            in("rdi") pages as u64,
+            in("rsi") out.as_mut_ptr() as u64,
+            lateout("rax") rc,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if rc != 0 {
+        unsafe { dbg_str("[virtio] dma_alloc FAILED\n") };
+        return (0, 0);
+    }
+    (out[0], out[1])
 }
 
 /// Округляет `v` вверх до кратного `align` (степень двойки).
