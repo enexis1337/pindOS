@@ -352,6 +352,11 @@ impl Virtqueue {
         let a0 = core::ptr::read_volatile(&(*self.avail).ring[0]);
         dbg_str(&alloc::format!("[virtio]   RAW used.ring[0]={{id:{} len:{}}} desc[0]={{addr:{:#x} len:{} flags:{}}} avail.ring[0]={}\n",
             u_id, u_len, d_addr, d_len, d_flg, a0));
+        // Status читаем отдельно: 0x47 означает NEEDS_RESET (бит 0x40),
+        // то есть устройство само отказалось от нашего драйвера.
+        let st = inb(self.io_base + REG_STATUS);
+        dbg_str(&alloc::format!("[virtio] RX {}: status={:#04x} (NEEDS_RESET={})\n",
+            tag, st, (st & 0x40) != 0));
         dbg_str(&alloc::format!(
             "[virtio] RX {}: avail.idx={} avail.flags={} used.idx={} used.flags={} last_used={} isr={:#x}\n",
             tag, a_idx, a_flg, u_idx, u_flg, self.last_used, inb(self.io_base + REG_ISR)));
