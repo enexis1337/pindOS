@@ -17,15 +17,26 @@ pub const BUF_SIZE: usize = VIRTIO_NET_HDR_LEN + MAX_FRAME;
 /// Сколько буферов публикуем в RX-очередь при инициализации.
 const BUF_COUNT: usize = 32;
 
-// Регистры legacy virtio-pci (MMIO BAR0, как у QEMU по умолчанию).
-const VIRTIO_MMIO_STATUS:  u16 = 0x100;
-const VIRTIO_MMIO_DEVICE_FEATURES: u16 = 0x104;
-const VIRTIO_MMIO_DRIVER_FEATURES: u16 = 0x120;
+// Карта регистров legacy virtio-pci (I/O BAR0). Это НЕ MMIO-карта virtio-mmio:
+// у legacy-pci смещения маленькие, а Status — однобайтовый регистр.
+// Смешивание mmio (0x100) и legacy (0x12) было причиной мусорных readback.
+const REG_DEVICE_ID:      u16 = 0x00; // 32-бит, читаем
+const REG_VENDOR_ID:      u16 = 0x04; // 32-бит (младшие 16 = vendor)
+const REG_DEVICE_FEATURES: u16 = 0x04; // 32-бит
+const REG_DRIVER_FEATURES: u16 = 0x08; // 32-бит
+const REG_QUEUE_PFN:      u16 = 0x08; // 32-бит
+const REG_QUEUE_NUM:      u16 = 0x0C; // 16-бит!
+const REG_QUEUE_SEL:      u16 = 0x0E; // 16-бит
+const REG_QUEUE_NOTIFY:   u16 = 0x10; // 16-бит
+const REG_STATUS:         u16 = 0x12; // 8-бит!
+const REG_QUEUE_ENABLE:   u16 = 0x13; // 8-бит (в MMIO это был READY)
+const REG_MAC:            u16 = 0x14; // 6 байт, читаем по одному
+
 /// VIRTIO_NET_F_MAC (бит 5) — устройство сообщает MAC в конфигурации.
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
-const STATUS_ACKNOWLEDGE: u32 = 1;
-const STATUS_DRIVER:     u32 = 2;
-const STATUS_DRIVER_OK:  u32 = 4;
+const STATUS_ACKNOWLEDGE: u8 = 1;
+const STATUS_DRIVER:     u8 = 2;
+const STATUS_DRIVER_OK:  u8 = 4;
 
 #[repr(C)]
 struct VirtqDesc {
@@ -83,30 +94,42 @@ unsafe fn dbg_str(s: &str) {
 /// Без DRIVER_OK устройство остаётся в DRIVER_FAILS: TX-кольцо ещё кое-как
 /// работает, но RX не приходит никогда и used.idx не растёт.
 pub unsafe fn start_device(io_base: u16) {
-    // Диагностика: опрашиваем ключевые регистры до записи. У legacy
-    // virtio-pci DeviceID по смещению 0x00 равен 0x554d4551 ("QEMU").
-    // Если читается 0xffffffff, порт не декодируется вовсе.
-    let did = inl(io_base + 0x00);
-    let vid = inl(io_base + 0x04);
-    let st0 = inl(io_base + 0x100);
-    dbg_str(&alloc::format!("[virtio] probe io_base={:#x} DEVICE_ID={:#x} VENDOR_ID={:#x} STATUS={:#x}\n",
-        io_base, did, vid, st0));
+    // ── Шаг 3: проверка пути ввода-вывода ДО handshake ──
+    // Legacy DeviceID по +0x00 = 0x554d4551 ("QEMU"). MAC лежит шестью
+    // байтами по +0x14..+0x19. Если MAC читается верно, порты и BAR
+    // заведомо рабочие, и дальше можно верить остальным readback.
+    let did = inl(io_base + REG_DEVICE_ID);
+    dbg_str(&alloc::format!("[virtio] legacy DeviceID = {:#x} (want 0x554d4551)\n", did));
+    let m0 = inb(io_base + REG_MAC + 0);
+    let m1 = inb(io_base + REG_MAC + 1);
+    let m2 = inb(io_base + REG_MAC + 2);
+    let m3 = inb(io_base + REG_MAC + 3);
+    let m4 = inb(io_base + REG_MAC + 4);
+    let m5 = inb(io_base + REG_MAC + 5);
+    dbg_str(&alloc::format!("[virtio] MAC = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+        m0, m1, m2, m3, m4, m5));
 
-    outl(io_base + VIRTIO_MMIO_STATUS, 0);
-    outl(io_base + VIRTIO_MMIO_STATUS, STATUS_ACKNOWLEDGE);
-    outl(io_base + VIRTIO_MMIO_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+    // ── Шаг 4: handshake строго по порядку, 8-битный Status ──
+    outb(io_base + REG_STATUS, 0);
+    let s = inb(io_base + REG_STATUS);
+    dbg_str(&alloc::format!("[virtio] status after reset      = {:#04x} (want 0x00)\n", s));
 
-    // Диагностика: читаем статус обратно. Ожидаем 0x03; 0xff означает, что
-    // порт не отвечает и мы обращаемся не туда.
-    let st = inl(io_base + VIRTIO_MMIO_STATUS);
-    dbg_str(&alloc::format!("[virtio] status readback after DRIVER = {:#x} (want 0x3)\n", st));
+    outb(io_base + REG_STATUS, STATUS_ACKNOWLEDGE);
+    let s = inb(io_base + REG_STATUS);
+    dbg_str(&alloc::format!("[virtio] status after ACKNOWLEDGE = {:#04x} (want 0x01)\n", s));
 
-    // Запрашиваем у устройства набор фич и оставляем только те, что реально
-    // поддерживаем: только VIRTIO_NET_F_MAC (устройство сообщит MAC сам).
-    // Никаких VIRTIO_F_VERSION_1 / MRG_RXBUF / GSO: под них у нас нет кода.
-    let device_features = inl(io_base + VIRTIO_MMIO_DEVICE_FEATURES);
-    let driver_features = device_features & VIRTIO_NET_F_MAC;
-    outl(io_base + VIRTIO_MMIO_DRIVER_FEATURES, driver_features);
+    outb(io_base + REG_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+    let s = inb(io_base + REG_STATUS);
+    dbg_str(&alloc::format!("[virtio] status after DRIVER     = {:#04x} (want 0x03)\n", s));
+
+    // Фичи: забираем у устройства и оставляем только MAC (бит 5).
+    // Никаких VIRTIO_F_VERSION_1 / MRG_RXBUF / GSO — под них кода нет.
+    let device_features = inl(io_base + REG_DEVICE_FEATURES);
+    let mut driver_features = 0u32;
+    if device_features & VIRTIO_NET_F_MAC != 0 {
+        driver_features |= VIRTIO_NET_F_MAC;
+    }
+    outl(io_base + REG_DRIVER_FEATURES, driver_features);
     dbg_str(&alloc::format!("[virtio] features dev={:#x} drv={:#x}\n",
         device_features, driver_features));
 
@@ -115,10 +138,11 @@ pub unsafe fn start_device(io_base: u16) {
 
 /// Выставляет DRIVER_OK: очереди сконфигурированы и буферы опубликованы.
 pub unsafe fn finish_device(io_base: u16) {
-    outl(io_base + VIRTIO_MMIO_STATUS,
-         STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
-    let st = inl(io_base + VIRTIO_MMIO_STATUS);
-    dbg_str(&alloc::format!("[virtio] status readback after DRIVER_OK = {:#x} (want 0x7)\n", st));
+    outb(io_base + REG_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
+    let s = inb(io_base + REG_STATUS);
+    dbg_str(&alloc::format!("[virtio] status after DRIVER_OK  = {:#04x} (want 0x07)\n", s));
+    // Notify для RX-очереди, чтобы устройство начало смотреть на avail.
+    outw(io_base + REG_QUEUE_NOTIFY, 0);
     dbg_str("[virtio] DRIVER_OK\n");
 }
 
@@ -131,11 +155,11 @@ impl Virtqueue {
         // Handshake делает start_device() один раз, до настройки очередей.
 
         dbg_str("[virtio] QUEUE_SEL\n");
-        outw(io_base + 14, queue_idx);
+        outw(io_base + REG_QUEUE_SEL, queue_idx);
 
         // Размер очереди читаем у устройства, а не берём константой: QEMU
         // сообщает фактический QUEUE_SIZE, и жёсткое 256 могло не совпасть.
-        let qsize = inw(io_base + 12) as usize;
+        let qsize = inw(io_base + REG_QUEUE_NUM) as usize;
         let qsize = if qsize == 0 { QUEUE_SIZE } else { qsize };
         dbg_str(&alloc::format!("[virtio] queue {} size={} (const {})\n", queue_idx, qsize, QUEUE_SIZE));
 
@@ -173,14 +197,19 @@ impl Virtqueue {
 
         dbg_str("[virtio] QUEUE_PFN\n");
         // В QUEUE_PFN уходит ФИЗИЧЕСКИЙ адрес, не виртуальный.
-        outl(io_base + 8,  (ptr_phys as u64 / 4096) as u32);
+        outl(io_base + REG_QUEUE_PFN, (ptr_phys as u64 / 4096) as u32);
 
         // Диагностика: читаем QUEUE_PFN и QUEUE_NUM back. 0xffffffff означает
         // плавающую шину, то есть устройство по этому BAR не отвечает вовсе.
-        let pfn_rb = inl(io_base + 8);
-        let num_rb = inl(io_base + 12);
-        dbg_str(&alloc::format!("[virtio] q{} readback PFN={:#x} (wrote {:#x}) NUM={} READY={}\n",
-            queue_idx, pfn_rb, (ptr_phys as u64 / 4096) as u32, num_rb, inl(io_base + 18)));
+        let pfn_rb = inl(io_base + REG_QUEUE_PFN);
+        let num_rb = inw(io_base + REG_QUEUE_NUM);
+        // Legacy: очередь надо ЯВНО разрешить записью 1 в QUEUE_ENABLE (+0x13),
+        // иначе устройство не обрабатывает её вовсе. Раньше этот регистр
+        // только читался и оставался 0 — кольцо игнорировалось.
+        outb(io_base + REG_QUEUE_ENABLE, 1);
+        let en_rb = inb(io_base + REG_QUEUE_ENABLE);
+        dbg_str(&alloc::format!("[virtio] q{} readback PFN={:#x} (wrote {:#x}) NUM={} ENABLE={}\n",
+            queue_idx, pfn_rb, (ptr_phys as u64 / 4096) as u32, num_rb, en_rb));
 
         dbg_str("[virtio] init done\n");
 
@@ -233,7 +262,7 @@ impl Virtqueue {
         if posted > 0 {
             dbg_str("[virtio] rx buffers ready\n");
             // Сообщаем устройству, что буферы появились.
-            outw(self.io_base + 16, self.queue_idx);
+            outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
         }
     }
 
@@ -264,7 +293,7 @@ impl Virtqueue {
         (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
         fence(Ordering::Release);
 
-        outw(self.io_base + 16, self.queue_idx);
+        outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
     }
 
     pub unsafe fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
@@ -300,7 +329,7 @@ impl Virtqueue {
         fence(Ordering::Release);
         (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
         fence(Ordering::Release);
-        outw(self.io_base + 16, self.queue_idx);
+        outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
 
         Some(len)
     }
@@ -339,6 +368,16 @@ pub fn dma_alloc_pages(pages: usize) -> (u64, u64) {
 /// Округляет `v` вверх до кратного `align` (степень двойки).
 const fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) & !(align - 1)
+}
+
+unsafe fn inb(port: u16) -> u8 {
+    let v: u8;
+    core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nostack));
+    v
+}
+
+unsafe fn outb(port: u16, val: u8) {
+    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack));
 }
 
 unsafe fn inw(port: u16) -> u16 {
