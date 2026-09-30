@@ -77,7 +77,6 @@ pub struct Virtqueue {
     io_base:   u16,
     queue_idx: u16,
     /// Следующий дескриптор для публикации в avail ring (RX).
-    next_post: u16,
     /// Размер очереди, прочитанный у устройства (QUEUE_SIZE, io_base+12).
     qsize: usize,
     /// Физические адреса RX-буферов по индексу дескриптора (0 = не выделен).
@@ -249,7 +248,7 @@ impl Virtqueue {
 
         dbg_str("[virtio] init done\n");
 
-        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, next_post: 0, qsize, buf_phys: [0u64; QUEUE_SIZE], next_tx: 0 };
+        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, qsize, buf_phys: [0u64; QUEUE_SIZE], next_tx: 0 };
         // Для RX-очереди дескрипторы должны быть опубликованы в avail ring:
         // иначе у устройства нет ни одного буфера, куда писать, used.idx
         // никогда не растёт и recv() всегда возвращает None.
@@ -272,48 +271,32 @@ impl Virtqueue {
     /// Идём по индексам, а не по free-list: в этой реализации 0 служит и
     /// началом списка, и его концом, поэтому обход по `next` неотличим от
     /// пустого списка.
+    /// Первоначальная публикация RX-буферов: выделяем буферы для дескрипторов
+    /// 0..count. Дальше они возвращаются в avail через repost_descriptor() по
+    /// индексу из used-элемента, поэтому отдельного счётчика не требуется.
     pub unsafe fn post_receive_buffers(&mut self, count: usize) {
+        let n = if count > self.qsize { self.qsize } else { count };
         let mut posted = 0usize;
-        while posted < count {
-            let idx = self.next_post as usize;
-            if idx >= self.qsize - 1 { break; }
-            self.next_post += 1;
-
-            // Буфер приёма — тоже физическая память из ядра: virtio пишет
-            // кадр напрямую по физическому адресу из дескриптора.
-            let (buf_virt, buf_phys) = dma_alloc_pages((BUF_SIZE + 4095) / 4096);
-            if buf_virt == 0 { break; }
-
-            // Физический адрес буфера запоминаем по индексу дескриптора:
-            // в recv() нам нужно копировать данные именно из него.
+        for idx in 0..n {
+            // Буфер приёма — физическая память из ядра: устройство пишет кадр
+            // напрямую по физическому адресу из дескриптора.
+            let (_buf_virt, buf_phys) = dma_alloc_pages((BUF_SIZE + 4095) / 4096);
+            if buf_phys == 0 { break; }
             self.buf_phys[idx] = buf_phys;
-
-            (*self.desc.add(idx)).addr  = buf_phys;
-            (*self.desc.add(idx)).len   = BUF_SIZE as u32;
-            // WRITE: устройство пишет в этот буфер. NEXT НЕ выставляем —
-            // иначе устройство идёт по цепочке (ошибка "Looped descriptor").
-            (*self.desc.add(idx)).flags = VRING_DESC_F_WRITE;
-            (*self.desc.add(idx)).next  = 0;
-            (*self.desc.add(idx)).next  = 0;
-
-            let avail_idx = (*self.avail).idx as usize % self.qsize;
-            (*self.avail).ring[avail_idx] = idx as u16;
-            fence(Ordering::Release);
-            (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
+            self.publish(idx, buf_phys);
             posted += 1;
         }
-        fence(Ordering::Release);
         if posted > 0 {
             dbg_str("[virtio] rx buffers ready\n");
-            // Сообщаем устройству, что буферы появились.
-            outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
         }
     }
 
-    /// Возвращает уже использованный дескриптор в avail с тем же буфером.
-    /// Единая точка публикации RX-буферов: используется и при инициализации
-    /// (через post_receive_buffers), и после каждого recv.
-    pub unsafe fn repost_descriptor(&mut self, did: usize, phys: u64) {
+    /// Единая точка публикации RX-дескриптора.
+    ///
+    /// avail.idx растёт монотонно и монотонно же используется как указатель в
+    /// кольцо: индекс слота — `avail.idx % qsize`. Счётчик дескрипторов не
+    /// нужен, освободившийся индекс берётся из used-элемента.
+    pub unsafe fn publish(&mut self, did: usize, phys: u64) {
         (*self.desc.add(did)).addr  = phys;
         (*self.desc.add(did)).len   = BUF_SIZE as u32;
         (*self.desc.add(did)).flags = VRING_DESC_F_WRITE; // устройство пишет
@@ -324,6 +307,12 @@ impl Virtqueue {
         (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
         fence(Ordering::Release);
         outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
+    }
+
+    /// Возвращает использованный дескриптор в очередь. Индекс уже взят из
+    /// used-элемента в recv(), здесь только перепубликация с тем же буфером.
+    pub unsafe fn repost_descriptor(&mut self, did: usize, phys: u64) {
+        self.publish(did, phys);
     }
 
     /// Отправляет Ethernet-кадр. Данные уже без заголовков L2/L3/L4 —

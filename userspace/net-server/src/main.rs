@@ -197,6 +197,11 @@ fn main() -> i32 {
     let udp_handle = sockets.add(udp_sock);
 
     // 6. Event loop
+    // Тест RX: 600 broadcast-кадров, чтобы убедиться, что публикация буферов
+    // не останавливается после qsize кадров. Включается переменной окружения
+    // нет, поэтому гоняем всегда и сразу выходим.
+    const STRESS_FRAMES: u64 = 600;
+
     println!("[net-server] entering main event loop");
     let mut idle_polls: u64 = 0;
     let mut iface_routes_ready = false;
@@ -210,6 +215,17 @@ fn main() -> i32 {
         // smoltcp не начинает ARP-резолвинг, пока некуда отправлять пакет.
         // Периодически шлём UDP на шлюз: это заставляет интерфейс искать его
         // MAC через ARP (и, transitively, даёт трафик для 5d).
+        // Стресс: шлём broadcast-кадры, пока used.idx не превысит STRESS_FRAMES.
+        if device.frames_rx < STRESS_FRAMES && device.frames_tx < STRESS_FRAMES * 4 {
+            if idle_polls % 3 == 0 {
+                let _ = sockets.get_mut::<udp::Socket>(udp_handle).send(64, (gateway, 9));
+            }
+        }
+        if device.frames_rx >= STRESS_FRAMES {
+            println!("[net-server] RX stress OK: frames_rx={} frames_tx={}", device.frames_rx, device.frames_tx);
+            return 0;
+        }
+
         // Диагностика RX-кольца раз в 20000 итераций.
         if idle_polls % 20000 == 0 && idle_polls > 0 {
             unsafe { device.rx_queue.dump_rx_state("poll") };
