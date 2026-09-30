@@ -184,6 +184,7 @@ pub extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         1 => sys_write(a0, a1, a2),
         2 => sys_exec(a0, a1),
         3 => sys_waitpid(a0, a1),
+        4 => sys_time(),
         60 => sys_exit(a0 as i32),
         _ => -38,
     }
@@ -193,6 +194,15 @@ fn sys_yield() -> i64 {
     kprintln!("[syscall] yield called");
     crate::sched::yield_now();
     0
+}
+
+/// time() — монотонное время в миллисекундах с загрузки.
+///
+/// Счётчик APIC-таймера калибруется на 1 мс на тик (см. `calibrate_apic_timer`),
+/// поэтому миллисекунды равны числу тиков. Значение монотонное: при переключении
+/// задач CR3 меняется, но счётчик живёт в ядре и общий для всех.
+fn sys_time() -> i64 {
+    crate::arch::x86_64::apic::uptime_millis() as i64
 }
 
 /// exit(code) — завершить процесс

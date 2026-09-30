@@ -24,6 +24,31 @@ const TIMER_DIVIDE_CODE: u32 = 0x3; // divide by 16
 
 
 pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Значение APIC_TIMER_INITIAL_COUNT, которым таймер реально работает.
+///
+/// Сохраняется в `calibrate_apic_timer`. Сам по себе reload не даёт времени без
+/// знания частоты шины, но нужен для диагностики: по нему видно фактический
+/// период таймера, если калибровка вдруг даст не 1 мс на тик.
+static mut APIC_TIMER_RELOAD: u32 = 0;
+
+/// Калибровка задаёт период ровно в 1 мс на тик: `reload = elapsed / 10`,
+/// где `elapsed` отмерён PIT за 10 мс. Поэтому миллисекунды равны тикам
+/// напрямую, без пересчёта по частоте.
+pub fn uptime_millis() -> u64 {
+    TICK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Текущий reload таймера (диагностика/тесты).
+pub fn timer_reload() -> u32 {
+    unsafe { APIC_TIMER_RELOAD }
+}
+
+/// Инкрементирует счётчик тиков. Вызывается из вектора прерывания таймера
+/// ДО планировщика: если планировщик переключит контекст, счётчик уже учтён.
+pub fn tick_advance() {
+    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 static mut LOCAL_APIC_BASE: u64 = 0;
 static mut IRQ_HANDLERS: [Option<fn()>; 256] = [None; 256];
 const IRQ_HANDLERS_LEN: usize = 256;
@@ -80,8 +105,11 @@ fn calibrate_apic_timer() {
     let elapsed = 0xFFFF_FFFFu32.wrapping_sub(current);
     let reload = if elapsed == 0 { 1 } else { elapsed / 10 };
 
+    unsafe { APIC_TIMER_RELOAD = reload.max(1) };
     lapic_write(APIC_REG_LVT_TIMER, (TIMER_VECTOR as u32) | TIMER_MODE_PERIODIC);
     lapic_write(APIC_REG_TIMER_INITIAL_COUNT, reload.max(1));
+    crate::kprintln!("[apic] timer calibrated: reload={} (~1 ms/tick), tick={} ms",
+        reload.max(1), uptime_millis());
 }
 
 fn lapic_write(offset: u32, value: u32) {

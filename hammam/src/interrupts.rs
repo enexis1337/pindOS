@@ -102,6 +102,7 @@ pub unsafe extern "C" fn timer_interrupt_entry() {
         // и заблокирует все дальнейшие таймерные прерывания.
         "call {}",
         "call {}",
+        "call {}",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -113,6 +114,7 @@ pub unsafe extern "C" fn timer_interrupt_entry() {
         "pop rax",
         "iretq",
         sym crate::arch::x86_64::apic::lapic_eoi,
+        sym crate::arch::x86_64::apic::tick_advance,
         sym crate::sched::tick_now_debug,
     );
 }
