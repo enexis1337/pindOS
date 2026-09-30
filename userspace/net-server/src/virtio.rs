@@ -149,9 +149,20 @@ pub unsafe fn finish_device(io_base: u16) {
     outb(io_base + REG_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
     let s = inb(io_base + REG_STATUS);
     dbg_str(&alloc::format!("[virtio] status after DRIVER_OK  = {:#04x} (want 0x07)\n", s));
-    // Notify для RX-очереди, чтобы устройство начало смотреть на avail.
-    outw(io_base + REG_QUEUE_NOTIFY, 0);
     dbg_str("[virtio] DRIVER_OK\n");
+}
+
+/// Публикует RX-буферы и отправляет notify — вызывается ПОСЛЕ DRIVER_OK.
+///
+/// Порядок важен: пока статус не DRIVER_OK, устройство игнорирует notify, и
+/// пакеты, пришедшие раньше, остаются отложенными в SLIRP без надежды на
+/// доставку. Notify после DRIVER_OK заставляет QEMU переотдать отложенное.
+pub unsafe fn arm_rx_buffers(rx: &mut Virtqueue) {
+    rx.post_receive_buffers(BUF_COUNT);
+    outw(rx.io_base + REG_QUEUE_NOTIFY, 0);
+    dbg_str(&alloc::format!(
+        "[virtio] RX armed: avail.idx={} notify(0) sent, isr={:#x}\n",
+        (*rx.avail).idx, inb(rx.io_base + REG_ISR)));
 }
 
 impl Virtqueue {
@@ -239,7 +250,9 @@ impl Virtqueue {
         // Буферы приёма публикуются только в очереди 0. У TX-очереди их быть
         // не должно: лишние WRITE-дескрипторы там бессмысленны.
         if queue_idx == 0 {
-            q.post_receive_buffers(BUF_COUNT);
+            // Буферы публикуются, но notify здесь НЕ делаем: статус ещё не
+            // DRIVER_OK, и устройство отбрасывает notify вместе с уже
+            // пришедшими пакетами. Notify уходит после DRIVER_OK, в arm_rx_buffers().
         }
         // Диагностика: что реально лежит в кольцах сразу после инициализации.
         dbg_str(&alloc::format!("[virtio] q{} memcheck avail@{:p} used@{:p} avail.idx={} avail.ring[0]={} used.idx={}\n",
@@ -253,7 +266,7 @@ impl Virtqueue {
     /// Идём по индексам, а не по free-list: в этой реализации 0 служит и
     /// началом списка, и его концом, поэтому обход по `next` неотличим от
     /// пустого списка.
-    unsafe fn post_receive_buffers(&mut self, count: usize) {
+    pub unsafe fn post_receive_buffers(&mut self, count: usize) {
         let mut posted = 0usize;
         while posted < count {
             let idx = self.next_post as usize;

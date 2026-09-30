@@ -126,12 +126,14 @@ fn main() -> i32 {
     unsafe { virtio::start_device(pci_dev.bar0) };
 
     dbg_str("[main] init rx_queue\n");
-    let rx_queue = unsafe { virtio::Virtqueue::init(pci_dev.bar0, 0) };
+    let mut rx_queue = unsafe { virtio::Virtqueue::init(pci_dev.bar0, 0) };
     dbg_str("[main] init tx_queue\n");
     let tx_queue = unsafe { virtio::Virtqueue::init(pci_dev.bar0, 1) };
     dbg_str("[main] queues done\n");
     // Обе очереди готовы и буферы опубликованы — можно разрешить работу.
     unsafe { virtio::finish_device(pci_dev.bar0) };
+    // Буферы и notify — строго после DRIVER_OK.
+    unsafe { virtio::arm_rx_buffers(&mut rx_queue) };
 
     // 3. Создать Device wrapper для smoltcp
     let mut device = device::VirtioNetDevice {
