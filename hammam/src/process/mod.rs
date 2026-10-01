@@ -7,6 +7,80 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI32, AtomicBool, Ordering};
 
+/// Что умеет дескриптор.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FdKind {
+    /// Консоль COM1: читаемый (stdin) и/или пишущий (stdout, stderr).
+    Console,
+}
+
+/// Один открытый дескриптор.
+#[derive(Clone, Copy, Debug)]
+pub struct FdEntry {
+    pub kind: FdKind,
+    /// Можно ли читать: для консоли это fd 0.
+    pub readable: bool,
+    /// Можно ли писать: для консоли это fd 1 и fd 2.
+    pub writable: bool,
+}
+
+/// Максимум дескрипторов на процесс.
+pub const FD_TABLE_SIZE: usize = 16;
+
+/// Таблица дескрипторов процесса.
+///
+/// По умолчанию процесс получает консоль на 0, 1 и 2, то есть поведение
+/// совпадает с прежним жёстким `fd == 1`, но sys_write больше не смотрит
+/// на номер напрямую.
+#[derive(Clone)]
+pub struct FdTable {
+    entries: [Option<FdEntry>; FD_TABLE_SIZE],
+}
+
+impl FdTable {
+    /// Новая таблица: 0 — читаемая консоль, 1 и 2 — пишущие.
+    pub fn new() -> Self {
+        let mut entries = [None; FD_TABLE_SIZE];
+        entries[0] = Some(FdEntry { kind: FdKind::Console, readable: true,  writable: false });
+        entries[1] = Some(FdEntry { kind: FdKind::Console, readable: false, writable: true  });
+        entries[2] = Some(FdEntry { kind: FdKind::Console, readable: false, writable: true  });
+        Self { entries }
+    }
+
+    pub fn get(&self, fd: u32) -> Option<FdEntry> {
+        if fd as usize >= FD_TABLE_SIZE { return None; }
+        self.entries[fd as usize]
+    }
+
+    /// Можно ли писать в этот дескриптор.
+    pub fn is_writable(&self, fd: u32) -> bool {
+        self.get(fd).map(|e| e.writable).unwrap_or(false)
+    }
+
+    /// Можно ли читать из этого дескриптора.
+    pub fn is_readable(&self, fd: u32) -> bool {
+        self.get(fd).map(|e| e.readable).unwrap_or(false)
+    }
+
+    /// Занять свободный дескриптор с запрошенным доступом.
+    pub fn alloc(&mut self, kind: FdKind, readable: bool, writable: bool) -> Option<u32> {
+        for i in 0..FD_TABLE_SIZE {
+            if self.entries[i].is_none() {
+                self.entries[i] = Some(FdEntry { kind, readable, writable });
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// Закрыть дескриптор. 0, 1 и 2 закрывать нельзя: без них процесс
+    /// лишается консоли и не сможет сообщить об ошибке.
+    pub fn close(&mut self, fd: u32) -> bool {
+        if fd < 3 || fd as usize >= FD_TABLE_SIZE { return false; }
+        self.entries[fd as usize].take().is_some()
+    }
+}
+
 pub struct Process {
     pub pid:           u32,
     pub address_space: Arc<Mutex<AddressSpace>>,
@@ -16,6 +90,8 @@ pub struct Process {
     pub user_stack_top: u64,
     pub exit_code:     AtomicI32,
     pub is_zombie:     AtomicBool,
+    /// Дескрипторы процесса: 0 читает консоль, 1 и 2 пишут в неё.
+    pub fd_table:      SpinMutex<FdTable>,
 }
 
 impl Process {
@@ -114,6 +190,7 @@ impl Process {
             pid,
             address_space,
             cap_table,
+            fd_table: SpinMutex::new(FdTable::new()),
             main_task: task,
             entry_point,
             user_stack_top,

@@ -351,15 +351,32 @@ fn sys_exit(code: i32) -> i64 {
 }
 
 /// write(fd, buf, count) — вывести данные на serial
+/// Найти Process по текущей задаче: pid задачи равен pid процесса.
+fn find_process_by_task(task: &crate::sched::task::Task) -> Option<alloc::sync::Arc<crate::process::Process>> {
+    let pid = task.id.0 as u32;
+    PROCESS_TABLE.lock().get(&pid).cloned()
+}
+
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     if crate::sched::SCHED_DEBUG {
         kprintln!("[syscall] write: fd={} buf={:#x} len={}", fd, buf_ptr, len);
     }
-    if fd != 1 {
-        return -9;
+    // Право записи берём из fd-таблицы процесса, а не из жёсткого fd == 1.
+    let current = crate::sched::get_current_task().expect("no current task");
+
+    let proc = match find_process_by_task(current) {
+        Some(p) => p,
+        None => return -9,
+    };
+    {
+        let fds = proc.fd_table.lock();
+        match fds.get(fd as u32) {
+            None => return -9,          // EBADF
+            Some(e) if !e.writable => return -9,
+            _ => {}
+        }
     }
 
-    let current = crate::sched::get_current_task().expect("no current task");
     let aspace = current.address_space.lock();
 
     let slice = match validate_user_slice(&aspace, buf_ptr, len) {
