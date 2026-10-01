@@ -156,6 +156,12 @@ pub unsafe fn start_device(io_base: u16) {
     dbg_str("[virtio] driver init done\n");
 }
 
+/// Читает Status устройства (8-битный регистр +0x12). Для диагностики:
+/// 0x07 = DRIVER_OK, бит 0x40 = NEEDS_RESET.
+pub unsafe fn read_status(io_base: u16) -> u8 {
+    inb(io_base + REG_STATUS)
+}
+
 /// Выставляет DRIVER_OK: очереди сконфигурированы и буферы опубликованы.
 pub unsafe fn finish_device(io_base: u16) {
     outb(io_base + REG_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
@@ -304,14 +310,28 @@ impl Virtqueue {
     /// кольцо: индекс слота — `avail.idx % qsize`. Счётчик дескрипторов не
     /// нужен, освободившийся индекс берётся из used-элемента.
     pub unsafe fn publish(&mut self, did: usize, phys: u64) {
-        (*self.desc.add(did)).addr  = phys;
-        (*self.desc.add(did)).len   = BUF_SIZE as u32;
-        (*self.desc.add(did)).flags = VRING_DESC_F_WRITE; // устройство пишет
-        (*self.desc.add(did)).next  = 0;                  // без цепочки
-        let avail_idx = (*self.avail).idx as usize % self.qsize;
-        (*self.avail).ring[avail_idx] = did as u16;
+        let d = self.desc.add(did);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).addr), phys);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).len), BUF_SIZE as u32);
+        // Устройство пишет в буфер, цепочки нет.
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).flags), VRING_DESC_F_WRITE);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).next), 0u16);
+
+        // avail.idx читаем volatile: значение живёт в памяти, доступной и
+        // устройству, компилятор не имеет права считать его локальным.
+        let a_idx = core::ptr::read_volatile(core::ptr::addr_of!((*self.avail).idx));
+        let avail_idx = a_idx as usize % self.qsize;
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*self.avail).ring[avail_idx]),
+            did as u16,
+        );
+        // Сначала слот, потом индекс: устройство не должно увидеть
+        // неинициализированный слот под новым idx.
         fence(Ordering::Release);
-        (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*self.avail).idx),
+            a_idx.wrapping_add(1),
+        );
         fence(Ordering::Release);
         outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
     }
@@ -349,14 +369,22 @@ impl Virtqueue {
             }
         };
 
-        (*self.desc.add(idx)).addr  = dphys;
-        (*self.desc.add(idx)).len   = total as u32;
-        (*self.desc.add(idx)).flags = 0; // TX: устройство читает, WRITE не нужен
+        let d = self.desc.add(idx);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).addr), dphys);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).len), total as u32);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).flags), 0u16); // TX: чтение
 
-        let avail_idx = (*self.avail).idx as usize % self.qsize;
-        (*self.avail).ring[avail_idx] = idx as u16;
+        let a_idx = core::ptr::read_volatile(core::ptr::addr_of!((*self.avail).idx));
+        let avail_idx = a_idx as usize % self.qsize;
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*self.avail).ring[avail_idx]),
+            idx as u16,
+        );
         fence(Ordering::Release);
-        (*self.avail).idx = (*self.avail).idx.wrapping_add(1);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*self.avail).idx),
+            a_idx.wrapping_add(1),
+        );
         fence(Ordering::Release);
 
         outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
@@ -375,7 +403,8 @@ impl Virtqueue {
     /// next_tx % qsize, то есть кольцевой: раньше он рос монотонно и упирался
     /// в qsize, после чего send() молча терял все кадры.
     unsafe fn pop_free_tx(&mut self) -> Option<usize> {
-        let used_idx = core::ptr::read_volatile(&(*self.used).idx);
+        let used_idx = core::ptr::read_volatile(core::ptr::addr_of!((*self.used).idx));
+        fence(Ordering::Acquire);
         // Учитываем только возвраты, которые мы ещё не забрали.
         if last_after(self.last_tx, used_idx) {
             self.last_tx = used_idx;
@@ -415,22 +444,23 @@ impl Virtqueue {
     }
 
     pub unsafe fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
+        // used.idx публикует устройство: читаем volatile и сразу за ним
+        // Acquire, иначе успеваем прочитать idx раньше, чем данные элемента.
+        let used_idx = core::ptr::read_volatile(core::ptr::addr_of!((*self.used).idx));
         fence(Ordering::Acquire);
-        let used_idx = core::ptr::read_volatile(&(*self.used).idx);
         if used_idx == self.last_used { return None; }
 
-        // Диагностика: устройство наконец-то что-то отдало.
         dbg_str(&alloc::format!("[virtio] q{} used.idx={} last_used={}\n",
-            self.queue_idx, (*self.used).idx, self.last_used));
+            self.queue_idx, used_idx, self.last_used));
 
-        let elem = &(*self.used).ring[self.last_used as usize % self.qsize];
-        let did = elem.id as usize;
+        let slot = self.last_used as usize % self.qsize;
+        let did = core::ptr::read_volatile(core::ptr::addr_of!((*self.used).ring[slot].id)) as usize;
         let phys = self.buf_phys[did];
         if phys == 0 { return None; }
 
         // Устройство кладёт в буфер virtio_net_hdr (10 байт) перед кадром.
         // smoltcp о нём не знает, поэтому пропускаем и отдаём только Ethernet.
-        let raw = elem.len as usize;
+        let raw = core::ptr::read_volatile(core::ptr::addr_of!((*self.used).ring[slot].len)) as usize;
         if raw <= VIRTIO_NET_HDR_LEN { return None; }
         let frame = &*(phys as *const u8).add(VIRTIO_NET_HDR_LEN);
         let len = (raw - VIRTIO_NET_HDR_LEN).min(buf.len());
