@@ -325,18 +325,24 @@ pub fn start_scheduler() {
     }
 }
 
+/// Подробный лог планировщика. Выключен: при двух и более процессах он даёт
+/// тысячи строк в минуту и забивает COM1, когда появится shell.
+pub const SCHED_DEBUG: bool = false;
+
 pub fn schedule_now() {
     let pair = {
         let mut scheduler = SCHEDULER.lock();
-        kprintln!("[sched] schedule_now: current={:?}, run_queue_len={}",
-            scheduler.current.as_ref().map(|t| t.id.0), scheduler.run_queue.len());
+        if SCHED_DEBUG {
+            kprintln!("[sched] schedule_now: current={:?}, run_queue_len={}",
+                scheduler.current.as_ref().map(|t| t.id.0), scheduler.run_queue.len());
+        }
         scheduler.schedule_yield()
     };
     if let Some((from, to)) = pair {
-        kprintln!("[sched] switching context");
+        if SCHED_DEBUG { kprintln!("[sched] switching context"); }
         unsafe { switch_to_task(from, to) }
     } else {
-        kprintln!("[sched] no switch needed");
+        if SCHED_DEBUG { kprintln!("[sched] no switch needed"); }
     }
 }
 
@@ -359,14 +365,16 @@ pub fn tick_now() {
         }
     };
     if let Some((from, to)) = pair {
-        kprintln!("[tick] context switch");
+        if SCHED_DEBUG { kprintln!("[tick] context switch"); }
         unsafe { switch_to_task(from, to) }
     }
 }
 
 #[no_mangle]
 pub extern "C" fn tick_now_debug() {
-    unsafe { crate::drivers::serial::SERIAL.get().write_byte(b'.'); }
+    if SCHED_DEBUG {
+        unsafe { crate::drivers::serial::SERIAL.get().write_byte(b'.'); }
+    }
     tick_now();
 }
 

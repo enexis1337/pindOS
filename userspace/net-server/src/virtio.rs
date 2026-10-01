@@ -87,10 +87,15 @@ pub struct Virtqueue {
     last_tx: u16,
 }
 
+/// Диагностический вывод драйвера. Выключено: постоянные сообщения virtio
+/// забьют COM1, когда появится shell. Включать при разборе RX.
+const DEBUG_RINGS: bool = false;
+
 unsafe fn dbg_outb(port: u16, val: u8) {
     core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack));
 }
 unsafe fn dbg_str(s: &str) {
+    if !DEBUG_RINGS { return; }
     for &b in s.as_bytes() {
         dbg_outb(0x3f8, b);
     }

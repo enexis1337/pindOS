@@ -214,6 +214,9 @@ fn main() -> i32 {
     let mut idle_polls: u64 = 0;
     let mut iface_routes_ready = false;
     let mut ping = PingState::new(PING_IDENT, gateway);
+    // Шлюз ещё не в neighbor cache: пока не разрезолвен MAC, ICMP-пакеты
+    // smoltcp буферизует и они не уходят. Поэтому первый echo ждёт ARP.
+    let mut arp_ready = false;
     println!("[net-server] ping: {} packets to {}, interval={}ms timeout={}ms",
         PING_COUNT, gateway, PING_INTERVAL_MS, PING_TIMEOUT_MS);
     loop {
@@ -269,7 +272,12 @@ fn main() -> i32 {
         }
 
         // Отправляем очередной echo, если пора и ещё не исчерпали счётчик.
-        if ping.should_send(now_ms) {
+        if !arp_ready && device.arp_reply_rx > 0 {
+            arp_ready = true;
+            println!("[ping] gateway {} resolved, starting ping", gateway);
+        }
+
+        if arp_ready && ping.should_send(now_ms) {
             let seq = ping.take_next_seq();
             let repr = Icmpv4Repr::EchoRequest {
                 ident: PING_IDENT,
