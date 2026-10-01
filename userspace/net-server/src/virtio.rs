@@ -91,6 +91,10 @@ pub struct Virtqueue {
 /// забьют COM1, когда появится shell. Включать при разборе RX.
 const DEBUG_RINGS: bool = false;
 
+/// Печать каждого выделения DMA-памяти. Под флагом только печать:
+/// само выделение выполняется в dma_alloc_pages() независимо.
+const TRACE_DMA: bool = false;
+
 unsafe fn dbg_outb(port: u16, val: u8) {
     core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack));
 }
@@ -280,8 +284,9 @@ impl Virtqueue {
 
         dbg_str("[virtio] init done\n");
 
-        // Печатаем все дескрипторы с len == 0 в таблице RX-очереди:
-        // столько их должно быть ровно qsize (ещё не опубликованы).
+        // Диагностика обхода таблицы дескрипторов. Под флагом только
+        // печать: чтения таблицы не являются условием работы драйвера.
+        if DEBUG_RINGS {
         let mut zero = 0usize;
         let mut first_zero = usize::MAX;
         for i in 0..qsize {
@@ -292,6 +297,7 @@ impl Virtqueue {
         }
         println!("[virtio] q{} desc table: {} of {} have len=0 (first {})",
             queue_idx, zero, qsize, first_zero);
+        }
 
         let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, qsize, buf_phys: [0u64; QUEUE_SIZE], next_tx: 0, last_tx: 0 };
         // Для RX-очереди дескрипторы должны быть опубликованы в avail ring:
@@ -545,8 +551,10 @@ pub fn dma_alloc_pages(pages: usize) -> (u64, u64) {
         unsafe { dbg_str("[virtio] dma_alloc FAILED\n") };
         return (0, 0);
     }
-    println!("[dma] call#{} pages={} virt={:#x} phys={:#x} end={:#x}",
-        unsafe { DMA_ALLOC_CALLS }, pages, out[0], out[1], out[0] + (pages * 4096) as u64);
+    if TRACE_DMA {
+        println!("[dma] call#{} pages={} virt={:#x} phys={:#x} end={:#x}",
+            unsafe { DMA_ALLOC_CALLS }, pages, out[0], out[1], out[0] + (pages * 4096) as u64);
+    }
     (out[0], out[1])
 }
 

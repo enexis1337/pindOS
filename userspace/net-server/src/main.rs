@@ -423,7 +423,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 /// ident нашего ping. Настоящий ping берёт его из PID.
 /// Печать раз в секунду: счётчики poll, состояние приёма, ICMP-буфер, статус
 /// устройства. Под флагом только печать — ни портов, ни памяти.
-const DIAG: bool = true;
+const DIAG: bool = false;
 
 const PING_IDENT: u16 = 0x1234;
 /// Сколько echo-запросов отправляем.
