@@ -162,6 +162,9 @@ fn self_desc(p: *mut VirtqDesc) -> *mut VirtqDesc { p }
 /// Ловушка на невалидный публикуемый дескриптор. Не флаг отладки: при
 /// len == 0 или addr == 0 QEMU отвергает буфер и очередь перестаёт работать,
 /// поэтому печатаем источник и останавливаемся.
+///
+/// LOAD-BEARING: без этого вызова RX не работает (0/5, zero sized buffers),
+/// причина не найдена, не удалять без 5 прогонов.
 unsafe fn check_desc(queue: u16, did: usize, phys: u64, len: u32, origin: &str) {
     if len == 0 || phys == 0 {
         println!("[virtio] ASSERT: q{} desc[{}] addr={:#x} len={} from {}",
