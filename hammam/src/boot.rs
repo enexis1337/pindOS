@@ -65,7 +65,7 @@ static mut BOOT_WORKSPACE: BootWorkspace = BootWorkspace {
 // `.data.boot` is the first section in `.data` (see link.ld / readelf -S).
 // MUST match the actual VADDR of BOOT_WORKSPACE — if this triple-faults on boot,
 // run «nm hammam-kernel | grep BOOT_WORKSPACE» and update this constant.
-const DATA_BOOT_VADDR: u32 = 0x000000000022c000;
+const DATA_BOOT_VADDR: u32 = 0x000000000022b000;
 const BOOT_PT_ADDR: u32 = DATA_BOOT_VADDR;
 const BOOT_PT_PDPT_OFF: u32 = 4096;
 const BOOT_PT_PD_OFF: u32 = 8192;
