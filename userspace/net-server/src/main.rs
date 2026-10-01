@@ -83,9 +83,9 @@ mod virtio;
 use alloc::vec;
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
-    socket::udp,
+    socket::{udp, icmp},
     time::Instant,
-    wire::{EthernetAddress, IpCidr, Ipv4Address},
+    wire::{EthernetAddress, IpAddress, IpCidr, Icmpv4Packet, Icmpv4Repr, Ipv4Address},
 };
 
 /// Завершение процесса через sys_exit(60).
@@ -193,54 +193,123 @@ fn main() -> i32 {
     // Сокет обязан быть в SocketSet, иначе poll() его не опрашивает и никакого
     // исходящего трафика (а значит, и ARP-резолвинга) не будет. handle нужен,
     // чтобы потом достать сокет обратно для send().
+    // ICMP-сокет для ping. ident здесь один на весь процесс, как у настоящего
+    // ping; seq_no растёт, по нему же сверяем ответ и считаем RTT.
+    let icmp_rx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0u8; 1024]);
+    let icmp_tx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0u8; 256]);
+    let mut icmp_sock = icmp::Socket::new(icmp_rx, icmp_tx);
+    // smoltcp сам отбрасывает Echo с чужим ident, если сокет привязан к Ident.
+    icmp_sock
+        .bind(icmp::Endpoint::Ident(PING_IDENT))
+        .map_err(|e| println!("[net-server] icmp bind failed: {:?}", e))
+        .ok();
+
+    // Сокеты обязаны быть в SocketSet, иначе poll() их не опрашивает.
     let mut sockets = SocketSet::new(vec![]);
     let udp_handle = sockets.add(udp_sock);
+    let icmp_handle = sockets.add(icmp_sock);
 
     // 6. Event loop
-    // Тест RX: 600 broadcast-кадров, чтобы убедиться, что публикация буферов
-    // не останавливается после qsize кадров. Включается переменной окружения
-    // нет, поэтому гоняем всегда и сразу выходим.
-    const STRESS_FRAMES: u64 = 600;
-
     println!("[net-server] entering main event loop");
     let mut idle_polls: u64 = 0;
     let mut iface_routes_ready = false;
+    let mut ping = PingState::new(PING_IDENT, gateway);
+    println!("[net-server] ping: {} packets to {}, interval={}ms timeout={}ms",
+        PING_COUNT, gateway, PING_INTERVAL_MS, PING_TIMEOUT_MS);
     loop {
         // Настоящее монотонное время вместо счётчика итераций: smoltcp
         // сравнивает timestamps с таймаутами сокетов, и растущий счётчик
         // вёл себя как часы с произвольной скоростью.
-        let now = Instant::from_millis(sys_time() as i64);
+        let now_ms = sys_time();
+        let now = Instant::from_millis(now_ms as i64);
         iface.poll(now, &mut device, &mut sockets);
 
         // smoltcp не начинает ARP-резолвинг, пока некуда отправлять пакет.
         // Периодически шлём UDP на шлюз: это заставляет интерфейс искать его
         // MAC через ARP (и, transitively, даёт трафик для 5d).
-        // Стресс: шлём broadcast-кадры, пока used.idx не превысит STRESS_FRAMES.
-        if device.frames_rx < STRESS_FRAMES && device.frames_tx < STRESS_FRAMES * 4 {
-            if idle_polls % 3 == 0 {
-                let _ = sockets.get_mut::<udp::Socket>(udp_handle).send(64, (gateway, 9));
-            }
-        }
-        if device.frames_rx >= STRESS_FRAMES {
-            unsafe { device.rx_queue.dump_rx_state("final") };
-            println!("[net-server] RX stress OK: frames_rx={} frames_tx={}", device.frames_rx, device.frames_tx);
-            return 0;
-        }
-
         // Диагностика RX-кольца раз в 20000 итераций.
         if idle_polls % 20000 == 0 && idle_polls > 0 {
             unsafe { device.rx_queue.dump_rx_state("poll") };
         }
 
-        if idle_polls % 500 == 0 {
-            match sockets.get_mut::<udp::Socket>(udp_handle).send(1, (gateway, 9)) {
-                Ok(buf) => buf[0] = 0xAA,
+        // 5d: ping. Приём EchoReply: сверяем ident/seq и печатаем RTT.
+        // smoltcp отдаёт полезную нагрузку и адрес источника; ident он уже
+        // проверил сам при bind(Endpoint::Ident(..)). seq лежит в payload-echo.
+        // Буфер приёма заметно больше payload: recv_slice кладёт туда весь
+        // ICMP-пакет, и при размере ровно 32 приходил Truncated.
+        let mut rx_buf = [0u8; 128];
+        loop {
+            let recv = sockets.get_mut::<icmp::Socket>(icmp_handle).recv_slice(&mut rx_buf);
+            match recv {
+                Ok((n, src)) => {
+                    let now_ms = sys_time();
+                    let src_v4 = match src { IpAddress::Ipv4(v) => v, _ => continue };
+                    // Наш payload начинается с "pindos-icmp-ping" — по нему
+                    // узнаём, что это ответ на наш запрос.
+                    // recv_slice отдаёт весь ICMP-пакет: 8 байт заголовка
+                    // (type, code, cksum, ident, seq) и дальше payload.
+                    if n < ICMP_ECHO_HDR_LEN { continue; }
+                    let ident = u16::from_be_bytes([rx_buf[4], rx_buf[5]]);
+                    let seq  = u16::from_be_bytes([rx_buf[6], rx_buf[7]]);
+                    let payload = &rx_buf[ICMP_ECHO_HDR_LEN..n];
+                    let ours = payload.len() >= 8 && &payload[..8] == b"pindos-";
+                    match ping.on_reply(now_ms, ident, seq) {
+                        Some(rtt) => println!("[ping] reply from {} seq={} rtt={}ms", src_v4, seq, rtt),
+                        None => println!("[ping] reply from {} ident={:#06x} seq={} — not ours (ours={})",
+                            src_v4, ident, seq, ours),
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if ping.done() {
+            println!("[ping] finished: {} sent, {} replied, {} timed out",
+                ping.sent, ping.replies, ping.timeouts);
+            return 0;
+        }
+
+        // Отправляем очередной echo, если пора и ещё не исчерпали счётчик.
+        if ping.should_send(now_ms) {
+            let seq = ping.take_next_seq();
+            let repr = Icmpv4Repr::EchoRequest {
+                ident: PING_IDENT,
+                seq_no: seq,
+                data: &PING_PAYLOAD,
+            };
+            // send_with передаёт сам Repr: smoltcp сам собирает ICMP-пакет и
+            // считает контрольную сумму.
+            // send_with передаёт Repr целиком: smoltcp сам сериализует пакет
+            // и считает контрольную сумму.
+            let pkt_len = repr.buffer_len();
+            let caps = smoltcp::phy::ChecksumCapabilities::ignored();
+            let r = sockets.get_mut::<icmp::Socket>(icmp_handle).send_with(
+                pkt_len,
+                IpAddress::Ipv4(gateway),
+                |raw| {
+                    // Icmpv4Packet::new_checked проверяет длину и заголовок,
+                    // repr.emit собирает тело и контрольную сумму.
+                    match Icmpv4Packet::new_checked(raw) {
+                        Ok(mut pkt) => {
+                            repr.emit(&mut pkt, &caps);
+                            repr.buffer_len()
+                        }
+                        Err(_) => 0,
+                    }
+                },
+            );
+            match r {
+                Ok(_) => { ping.on_sent(seq, now_ms); }
                 Err(e) => {
                     if idle_polls % 2000 == 0 {
-                        println!("[net-server] gateway probe error: {:?}, frames tx={} rx={}", e, device.frames_tx, device.frames_rx);
+                        println!("[ping] send error: {:?}", e);
                     }
                 }
             }
+        }
+
+        // Таймауты: 2 секунды на ответ.
+        for seq in ping.take_timeouts(now_ms) {
+            println!("[ping] seq={} timeout", seq);
         }
         if device.arp_reply_rx > 0 && !iface_routes_ready {
             iface_routes_ready = true;
@@ -327,4 +396,113 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     }
     // 1 = код паники; dealduck различает его по waitpid и не перезапустит сервис.
     sys_exit(1)
+}
+
+// ── 5d: ICMP echo (ping) до шлюза QEMU ───────────────────────────────────────
+
+/// ident нашего ping. Настоящий ping берёт его из PID.
+const PING_IDENT: u16 = 0x1234;
+/// Сколько echo-запросов отправляем.
+const PING_COUNT: u32 = 4;
+/// Интервал между запросами, мс.
+const PING_INTERVAL_MS: u64 = 1000;
+/// Сколько ждём ответа на конкретный seq, мс.
+const PING_TIMEOUT_MS: u64 = 2000;
+
+/// Заголовок ICMP echo: type(1) code(1) cksum(2) ident(2) seq(2).
+const ICMP_ECHO_HDR_LEN: usize = 8;
+
+const PING_PAYLOAD: [u8; 32] = [
+    b'p', b'i', b'n', b'd', b'o', b's', b'-', b'i', b'c', b'm', b'p', b'-', b'p', b'i', b'n', b'g',
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+];
+
+/// Состояние ping: счётчики, время отправки по seq, ожидающие ответа.
+struct PingState {
+    ident:       u16,
+    target:      Ipv4Address,
+    next_seq:    u16,
+    sent:        u32,
+    replies:     u32,
+    timeouts:    u32,
+    /// seq -> время отправки (мс). Ограниченный массив: PING_COUNT записей.
+    in_flight:   [(u16, u64); 8],
+    n_in_flight: usize,
+    last_send:   u64,
+}
+
+impl PingState {
+    fn new(ident: u16, target: Ipv4Address) -> Self {
+        Self {
+            ident,
+            target,
+            next_seq: 0,
+            sent: 0,
+            replies: 0,
+            timeouts: 0,
+            in_flight: [(0, 0); 8],
+            n_in_flight: 0,
+            last_send: 0,
+        }
+    }
+
+    /// Пора ли слать следующий запрос: интервал вышел и лимит не исчерпан.
+    fn should_send(&self, now_ms: u64) -> bool {
+        if self.sent >= PING_COUNT { return false; }
+        if self.sent == 0 { return true; }
+        now_ms.wrapping_sub(self.last_send) >= PING_INTERVAL_MS
+    }
+
+    /// Выдаёт следующий seq и сразу увеличивает счётчик.
+    fn take_next_seq(&mut self) -> u16 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        seq
+    }
+
+    fn on_sent(&mut self, seq: u16, now_ms: u64) {
+        self.sent += 1;
+        self.last_send = now_ms;
+        if self.n_in_flight < self.in_flight.len() {
+            self.in_flight[self.n_in_flight] = (seq, now_ms);
+            self.n_in_flight += 1;
+        }
+    }
+
+    /// Ответ: сверяем ident и seq с одним из ожидающих, возвращаем RTT.
+    fn on_reply(&mut self, now_ms: u64, ident: u16, seq: u16) -> Option<u64> {
+        if ident != self.ident { return None; }
+        for i in 0..self.n_in_flight {
+            if self.in_flight[i].0 == seq {
+                let sent_at = self.in_flight[i].1;
+                self.in_flight[i] = self.in_flight[self.n_in_flight - 1];
+                self.n_in_flight -= 1;
+                self.replies += 1;
+                return Some(now_ms.wrapping_sub(sent_at));
+            }
+        }
+        None
+    }
+
+    /// Возвращает seq, по которым ответ не пришёл за PING_TIMEOUT_MS.
+    fn take_timeouts(&mut self, now_ms: u64) -> alloc::vec::Vec<u16> {
+        let mut out = alloc::vec::Vec::new();
+        let mut i = 0;
+        while i < self.n_in_flight {
+            let (seq, sent_at) = self.in_flight[i];
+            if now_ms.wrapping_sub(sent_at) >= PING_TIMEOUT_MS {
+                self.timeouts += 1;
+                out.push(seq);
+                self.in_flight[i] = self.in_flight[self.n_in_flight - 1];
+                self.n_in_flight -= 1;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn done(&self) -> bool {
+        self.replies + self.timeouts >= PING_COUNT
+    }
 }
