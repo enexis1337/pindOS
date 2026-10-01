@@ -48,6 +48,17 @@ pub fn timer_reload() -> u32 {
 /// ДО планировщика: если планировщик переключит контекст, счётчик уже учтён.
 pub fn tick_advance() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Приём COM1: прерывание UART включено, но через IO-APIC не
+    // маршрутизируется, поэтому забираем байты опросом LSR из тика.
+    unsafe {
+        crate::drivers::serial::poll_serial_rx();
+    }
+    // Проверка: эхо набранного обратно на COM1. Это механика, а не
+    // фича: sys_read заберёт те же байты из кольцевого буфера.
+    while let Some(b) = crate::drivers::serial::pop_rx_echo() {
+        // SAFETY: запись в COM1 из контекста прерывания допустима.
+        unsafe { crate::drivers::serial::SERIAL.get().write_byte(b) };
+    }
 }
 static mut LOCAL_APIC_BASE: u64 = 0;
 static mut IRQ_HANDLERS: [Option<fn()>; 256] = [None; 256];

@@ -83,6 +83,28 @@ impl Serial {
         }
     }
 
+    /// Есть ли принятый байт: LSR бит 0 (Data Ready).
+    pub fn is_receive_ready(&self) -> bool {
+        // SAFETY: чтение LSR.
+        unsafe { (self.inb(5) & 0x01) != 0 }
+    }
+
+    /// Прочитать один принятый байт из RBR (смещение +0).
+    pub fn read_byte(&self) -> u8 {
+        // SAFETY: чтение RBR, вызывается только при is_receive_ready().
+        unsafe { self.inb(0) }
+    }
+
+    /// Включить прерывание приёма: IER (смещение +1) бит 0.
+    ///
+    /// Прерывание на приём через IO-APIC мы пока не маршрутизируем, поэтому
+    /// байты забирает опрос из таймерного тика. IER нужен, чтобы UART вообще
+    /// сигналил о готовности данных.
+    pub unsafe fn enable_rx_interrupt(&self) {
+        // SAFETY: запись IER.
+        unsafe { self.outb(1, 0x01) }
+    }
+
     /// Проверяет, пуст ли передающий буфер UART.
     fn is_transmit_empty(&self) -> bool {
         // Line Status Register (LSR) находится на смещении +5. Bit 5 = Transmit Holding Register Empty.
@@ -168,6 +190,103 @@ impl SerialPort {
 
 /// Глобальный экземпляр последовательного порта (без блокировки — ядро однопоточное).
 pub static SERIAL: SerialPort = SerialPort(UnsafeCell::new(Serial::new(COM1_BASE)));
+
+/// Ёмкость кольцевого буфера приёма COM1.
+pub const RX_RING_SIZE: usize = 256;
+
+/// Кольцевой буфер приёма COM1.
+///
+/// Заполняется из таймерного тика, поэтому работает без аллокаций и без
+/// прерываний: это важно, пока приём UART не подключён к IO-APIC.
+/// Индексы монотонные и оборачиваются по маске, буфер — степени двойки.
+pub struct RxRing {
+    /// Буфер в UnsafeCell: пишет и читает контекст прерывания/тика.
+    buf:   core::cell::UnsafeCell<[u8; RX_RING_SIZE]>,
+    head:  core::sync::atomic::AtomicUsize,
+    tail:  core::sync::atomic::AtomicUsize,
+}
+
+impl RxRing {
+    pub const fn new() -> Self {
+        Self {
+            buf: core::cell::UnsafeCell::new([0; RX_RING_SIZE]),
+            head: core::sync::atomic::AtomicUsize::new(0),
+            tail: core::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Положить байт. Переполнение молча теряет самый старый байт: консоль
+    /// не должна ронять систему из-за темпа набора.
+    pub fn push(&self, b: u8) {
+        let head = self.head.load(Ordering::Relaxed);
+        let next = (head + 1) & (RX_RING_SIZE - 1);
+        if next == self.tail.load(Ordering::Relaxed) {
+            let t = self.tail.load(Ordering::Relaxed);
+            self.tail.store((t + 1) & (RX_RING_SIZE - 1), Ordering::Relaxed);
+        }
+        // SAFETY: единственный писатель — контекст прерывания/тика.
+        unsafe { (*self.buf.get())[head] = b; }
+        self.head.store((head + 1) & (RX_RING_SIZE - 1), Ordering::Release);
+    }
+
+    /// Забрать один байт, если есть.
+    pub fn pop(&self) -> Option<u8> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        if tail == self.head.load(Ordering::Acquire) {
+            return None;
+        }
+        // SAFETY: единственный читатель — задача в системном вызове.
+        let b = unsafe { (*self.buf.get())[tail] };
+        self.tail.store((tail + 1) & (RX_RING_SIZE - 1), Ordering::Release);
+        Some(b)
+    }
+
+    /// Есть ли что читать.
+    pub fn has_data(&self) -> bool {
+        self.tail.load(Ordering::Acquire) != self.head.load(Ordering::Acquire)
+    }
+}
+
+unsafe impl Sync for RxRing {}
+
+/// Отдельный контекстный буфер для эха: пока sys_read не готов, кольцо
+/// возвращается обратно в порт, чтобы было видно, что приём вообще идёт.
+pub static RX_ECHO: SpinMutex<RxRing> = SpinMutex::new(RxRing::new());
+
+/// Переложить принятое из кольца в эхо-буфер.
+pub fn push_rx_echo(b: u8) {
+    RX_ECHO.lock().push(b);
+}
+
+/// Забрать накопленное из эхо-буфера, если есть.
+pub fn pop_rx_echo() -> Option<u8> {
+    RX_ECHO.lock().pop()
+}
+
+pub fn has_rx_echo() -> bool {
+    RX_ECHO.lock().has_data()
+}
+
+pub static RX_RING: RxRing = RxRing::new();
+
+/// Забрать всё накопленное с COM1 в кольцевой буфер ядра.
+///
+/// Вызывается из таймерного тика: прерывание приёма UART включено, но не
+/// маршрутизируется через IO-APIC, поэтому опрос LSR — единственный путь.
+pub unsafe fn poll_serial_rx() -> usize {
+    let mut n = 0;
+    // SAFETY: опрос порта из контекста прерывания допустим.
+    unsafe {
+        while SERIAL.get().is_receive_ready() {
+            let b = SERIAL.get().read_byte();
+            RX_RING.push(b);
+            push_rx_echo(b);
+            n += 1;
+            if n >= RX_RING_SIZE { break; }
+        }
+    }
+    n
+}
 
 /// Макрос для вывода форматированной строки в COM-порт ядра Hammam.
 #[macro_export]

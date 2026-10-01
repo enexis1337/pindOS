@@ -109,7 +109,12 @@ struct Mb2BootInfo {
 /// Точка входа ядра из assembly (_hammam_entry).
 #[no_mangle]
 pub extern "C" fn _start_multiboot2(magic: u32, mbi_ptr: u32) -> ! {
-    unsafe { drivers::serial::SERIAL.get().init(); }
+    unsafe {
+        drivers::serial::SERIAL.get().init();
+        // Приём COM1: включаем IER бит 0 (RDI). Данные забирает опрос LSR
+        // из таймерного тика, т.к. маршрутизации через IO-APIC пока нет.
+        drivers::serial::SERIAL.get().enable_rx_interrupt();
+    }
 
     kprintln!("Hammam / PINDOS booting...");
     kprintln!("magic = {:#x}", magic);
