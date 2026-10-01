@@ -6,6 +6,10 @@ extern crate alloc;
 /// -ECHILD от нашего sys_waitpid: процесс уже не отслеживается ядром.
 const ECHILD: i64 = -10;
 
+/// База, с которой ядро кодирует код возврата в sys_waitpid. Само значение 0
+/// значит «процесс ещё жив», поэтому код выхода не может быть им.
+const EXIT_CODE_BASE: i64 = 256;
+
 /// Результат неблокирующего sys_waitpid(WNOHANG).
 enum WaitResult {
     /// Процесс жив, код не доступен.
@@ -69,11 +73,20 @@ impl ServiceManager {
                     if let Some(pid) = self.units[i].pid {
                         match self.waitpid_nonblock(pid) {
                             WaitResult::Exited(code) => {
+                                let policy = match self.units[i].restart {
+                                    RestartPolicy::No => "No",
+                                    RestartPolicy::OnFailure => "OnFailure",
+                                    RestartPolicy::Always => "Always",
+                                };
+                                // Решение принимаем здесь, до handle_failure:
+                                // там счётчики и лимит могут отказать в рестарте.
+                                let want_restart = code != 0 && self.units[i].restart == RestartPolicy::OnFailure;
+                                crate::println!("[dealduck] {} (waitpid pid={}) exited code={}, policy={}, restart={}",
+                                    self.units[i].name, pid, code, policy, if want_restart { "yes" } else { "no" });
                                 if code == 0 {
                                     // Штатный выход: OnFailure перезапускать не должен.
                                     self.units[i].state = ServiceState::Stopped;
                                     self.units[i].pid = None;
-                                    crate::println!("[dealduck] {} exited cleanly, not restarting", self.units[i].name);
                                 } else {
                                     self.units[i].state = ServiceState::Failed;
                                     self.handle_failure(i);
@@ -83,7 +96,7 @@ impl ServiceManager {
                                 // -ECHILD: ядро уже не знает про этот pid.
                                 self.units[i].state = ServiceState::Failed;
                                 self.units[i].pid = None;
-                                crate::println!("[dealduck] {}: ECHILD, giving up", self.units[i].name);
+                                crate::println!("[dealduck] {}: ECHILD for pid={}, giving up", self.units[i].name, pid);
                             }
                             WaitResult::StillRunning => {}
                         }
@@ -110,9 +123,8 @@ impl ServiceManager {
     /// Решить, перезапускать ли упавший сервис, с учётом RestartPolicy и лимита.
     fn handle_failure(&mut self, i: usize) {
         let name = self.units[i].name;
-        crate::println!("[dealduck] {} exited, restarting...", name);
-
         if self.units[i].restart != RestartPolicy::OnFailure {
+            crate::println!("[dealduck] {} failed, no restart (policy)", name);
             return;
         }
 
@@ -157,8 +169,8 @@ impl ServiceManager {
         }
         match result {
             0 => WaitResult::StillRunning,
-            r if r == -ECHILD => WaitResult::NoChild,
-            r => WaitResult::Exited(r as i32),
+            r if r == ECHILD => WaitResult::NoChild,
+            r => WaitResult::Exited((r - EXIT_CODE_BASE) as i32),
         }
     }
 }

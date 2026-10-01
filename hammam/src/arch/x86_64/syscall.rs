@@ -422,6 +422,10 @@ fn sys_exec(path_ptr: u64, path_len: u64) -> i64 {
 }
 
 /// waitpid(pid, flags) — ожидать завершения процесса
+/// База кодирования кода возврата в sys_waitpid: 0 означает «процесс жив»,
+/// поэтому код выхода возвращается как EXIT_CODE_BASE + code.
+pub const EXIT_CODE_BASE: i64 = 256;
+
 fn sys_waitpid(pid: u64, flags: u64) -> i64 {
     let wnohang = flags & 1 != 0;
     let pid = pid as u32;
@@ -434,7 +438,10 @@ fn sys_waitpid(pid: u64, flags: u64) -> i64 {
                 let code = proc.exit_code.load(Ordering::Acquire);
                 drop(table);
                 PROCESS_TABLE.lock().remove(&pid);
-                code as i64
+                // Код возврата 0 неотличим от «процесс жив» (оба дают 0),
+                // поэтому кодируем выход как EXIT_CODE_BASE + code.
+                // Пользователь обязан вычитать базу.
+                EXIT_CODE_BASE + code as i64
             } else if wnohang {
                 0
             } else {
