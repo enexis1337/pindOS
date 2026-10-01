@@ -156,6 +156,22 @@ pub unsafe fn start_device(io_base: u16) {
     dbg_str("[virtio] driver init done\n");
 }
 
+/// Обёртка для чтения полей таблицы дескрипторов в диагностике.
+fn self_desc(p: *mut VirtqDesc) -> *mut VirtqDesc { p }
+
+/// Ловушка на невалидный публикуемый дескриптор. Не флаг отладки: при
+/// len == 0 или addr == 0 QEMU отвергает буфер и очередь перестаёт работать,
+/// поэтому печатаем источник и останавливаемся.
+unsafe fn check_desc(queue: u16, did: usize, phys: u64, len: u32, origin: &str) {
+    if len == 0 || phys == 0 {
+        println!("[virtio] ASSERT: q{} desc[{}] addr={:#x} len={} from {}",
+            queue, did, phys, len, origin);
+        loop {
+            core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
 /// Читает Status устройства (8-битный регистр +0x12). Для диагностики:
 /// 0x07 = DRIVER_OK, бит 0x40 = NEEDS_RESET.
 pub unsafe fn read_status(io_base: u16) -> u8 {
@@ -261,6 +277,19 @@ impl Virtqueue {
 
         dbg_str("[virtio] init done\n");
 
+        // Печатаем все дескрипторы с len == 0 в таблице RX-очереди:
+        // столько их должно быть ровно qsize (ещё не опубликованы).
+        let mut zero = 0usize;
+        let mut first_zero = usize::MAX;
+        for i in 0..qsize {
+            if core::ptr::read_volatile(core::ptr::addr_of!((*self_desc(desc)).len)) == 0 {
+                zero += 1;
+                if first_zero == usize::MAX { first_zero = i; }
+            }
+        }
+        println!("[virtio] q{} desc table: {} of {} have len=0 (first {})",
+            queue_idx, zero, qsize, first_zero);
+
         let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, qsize, buf_phys: [0u64; QUEUE_SIZE], next_tx: 0, last_tx: 0 };
         // Для RX-очереди дескрипторы должны быть опубликованы в avail ring:
         // иначе у устройства нет ни одного буфера, куда писать, used.idx
@@ -296,7 +325,7 @@ impl Virtqueue {
             let (_buf_virt, buf_phys) = dma_alloc_pages((BUF_SIZE + 4095) / 4096);
             if buf_phys == 0 { break; }
             self.buf_phys[idx] = buf_phys;
-            self.publish(idx, buf_phys);
+            self.publish(idx, buf_phys, "RX init");
             posted += 1;
         }
         if posted > 0 {
@@ -309,7 +338,12 @@ impl Virtqueue {
     /// avail.idx растёт монотонно и монотонно же используется как указатель в
     /// кольцо: индекс слота — `avail.idx % qsize`. Счётчик дескрипторов не
     /// нужен, освободившийся индекс берётся из used-элемента.
-    pub unsafe fn publish(&mut self, did: usize, phys: u64) {
+    pub unsafe fn publish(&mut self, did: usize, phys: u64, origin: &str) {
+        // ЛОВУШКА, а не отладочная печать: нулевая длина или нулевой адрес в
+        // публикуемом дескрипторе означают, что устройство получит мусор.
+        // QEMU на такой дескриптор отвечает "zero sized buffers are not allowed"
+        // и перестаёт наполнять очередь, поэтому здесь останавливаемся сразу.
+        check_desc(self.queue_idx, did, phys, BUF_SIZE as u32, origin);
         let d = self.desc.add(did);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).addr), phys);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).len), BUF_SIZE as u32);
@@ -339,7 +373,10 @@ impl Virtqueue {
     /// Возвращает использованный дескриптор в очередь. Индекс уже взят из
     /// used-элемента в recv(), здесь только перепубликация с тем же буфером.
     pub unsafe fn repost_descriptor(&mut self, did: usize, phys: u64) {
-        self.publish(did, phys);
+        // Именно сюда возвращается принятый дескриптор. Длина обязана быть
+        // BUF_SIZE, а не длина принятого кадра: used.ring[].len отражает
+        // фактический размер данных, публиковать его нельзя.
+        self.publish(did, phys, "RX recv re-post");
     }
 
     /// Отправляет Ethernet-кадр. Данные уже без заголовков L2/L3/L4 —
@@ -369,6 +406,7 @@ impl Virtqueue {
             }
         };
 
+        check_desc(self.queue_idx, idx, dphys, total as u32, "TX send");
         let d = self.desc.add(idx);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).addr), dphys);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*d).len), total as u32);
@@ -487,6 +525,7 @@ impl Virtqueue {
 pub fn dma_alloc_pages(pages: usize) -> (u64, u64) {
     // out-буфер для пары (virt, phys) кладём на стек.
     let mut out = [0u64; 2];
+    unsafe { DMA_ALLOC_CALLS += 1; }
     let rc: i64;
     unsafe {
         core::arch::asm!(
@@ -503,8 +542,13 @@ pub fn dma_alloc_pages(pages: usize) -> (u64, u64) {
         unsafe { dbg_str("[virtio] dma_alloc FAILED\n") };
         return (0, 0);
     }
+    println!("[dma] call#{} pages={} virt={:#x} phys={:#x} end={:#x}",
+        unsafe { DMA_ALLOC_CALLS }, pages, out[0], out[1], out[0] + (pages * 4096) as u64);
     (out[0], out[1])
 }
+
+/// Счётчик вызовов sys_dma_alloc — печатается при каждом выделении.
+static mut DMA_ALLOC_CALLS: u64 = 0;
 
 /// Округляет `v` вверх до кратного `align` (степень двойки).
 const fn align_up(v: usize, align: usize) -> usize {
