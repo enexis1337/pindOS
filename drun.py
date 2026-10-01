@@ -221,6 +221,55 @@ def copy_artifact(src: Path, dest_name: str):
     size = dest.stat().st_size / 1024
     print(f"  → drunned/{dest_name} ({size:.1f} KiB)")
 
+def sync_boot_workspace_addr() -> bool:
+    """Синхронизировать DATA_BOOT_VADDR с реальным адресом BOOT_WORKSPACE.
+
+    Секция .data ядра сдвигается при каждом изменении размера встроенного
+    ELF net-server (он лежит в .rodata через include_bytes!). Константа в
+    boot.rs от этого уезжает, и ядро падает мгновенно, до единого print.
+    Возвращает True, если константу пришлось править.
+    """
+    import subprocess, re
+
+    if not KERNEL_DEBUG.exists():
+        return False
+
+    nm_out = subprocess.check_output(["nm", str(KERNEL_DEBUG)], text=True)
+    m = re.search(r'([0-9a-f]+)\s+\w\s+\S*BOOT_WORKSPACE\S*', nm_out)
+    if not m:
+        print("  [WARN] BOOT_WORKSPACE symbol not found in ELF")
+        return False
+
+    real = int(m.group(1), 16)
+    boot_rs_path = ROOT / "hammam/src/boot.rs"
+    boot_rs = boot_rs_path.read_text()
+    c = re.search(r'DATA_BOOT_VADDR:\s*u32\s*=\s*(0x[0-9a-fA-F]+)', boot_rs)
+    if not c:
+        print("  [WARN] DATA_BOOT_VADDR not found in boot.rs")
+        return False
+
+    if int(c.group(1), 16) == real:
+        return False
+
+    print(f"  [FIX] DATA_BOOT_VADDR {c.group(1)} -> {real:#x}, пересобираю ядро")
+    boot_rs_path.write_text(boot_rs.replace(c.group(1), f"{real:#x}"))
+    run(["cargo", "build", "--target", TARGET], cwd=HAMMAM_DIR, check=False)
+    return True
+
+
+def rebuild_iso_forced():
+    """Принудительная пересборка ISO: снести образ и промежуточный каталог."""
+    for stale in (ROOT / "hammam.iso", ROOT / "hammam.iso.new"):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+    iso_root = ROOT / "iso_root/boot"
+    if iso_root.exists():
+        shutil.rmtree(iso_root)
+    sh("bash tools/make_iso.sh")
+
+
 def check_boot_workspace_addr():
     """Проверить что DATA_BOOT_VADDR в boot.rs совпадает с реальным адресом BOOT_WORKSPACE."""
     import subprocess, re
@@ -319,13 +368,22 @@ def cmd_test():
     """-T : собрать + запустить QEMU с отладочным выводом."""
     banner("dRun TEST (QEMU debug)")
     
-    # Сначала собрать
+    # Порядок важен: userspace-бинари встраиваются в ядро через include_bytes!,
+    # поэтому собираем их ДО ядра, иначе ядро утащит устаревшие ELF.
+    print("  Сборка userspace (встраивается в ядро)...")
+    for d in ("userspace/net-server", "dealduck"):
+        run(["cargo", "build", "--release", "--target", TARGET],
+            cwd=ROOT / d, check=False)
+
     print("  Сборка Hammam kernel...")
     run(["cargo", "build", "--target", TARGET], cwd=HAMMAM_DIR)
+
+    # .data сдвигается при изменении встроенных ELF, константа за это не знает.
+    sync_boot_workspace_addr()
     check_boot_workspace_addr()
-    
-    print("  Создание ISO...")
-    sh("bash tools/make_iso.sh")
+
+    print("  Создание ISO (принудительно)...")
+    rebuild_iso_forced()
     copy_artifact(ISO_PATH, "pindos-debug.iso")
     
     # Запустить QEMU
