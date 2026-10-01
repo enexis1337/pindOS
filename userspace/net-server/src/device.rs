@@ -18,6 +18,9 @@ pub struct VirtioNetDevice {
     pub frames_tx: u64,
 }
 
+/// Печатать каждый ARP-кадр в обе стороны. Выключено по умолчанию.
+const TRACE_ARP: bool = false;
+
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ARP_OP_REQUEST: u16 = 1;
 const ARP_OP_REPLY: u16 = 2;
@@ -29,7 +32,9 @@ const ARP_OP_REPLY: u16 = 2;
 /// Целевой IP (tpa при request, spa при reply) лежит по смещению 0x26 от начала
 /// кадра, назначение запроса — по 0x30.
 fn trace_arp(frame: &[u8], tx: bool) {
-    if frame.len() < 42 {
+    // ARP-трассировка нужна только при разборе сети, в обычной работе она
+    // засоряет COM1 (smoltcp шлёт ARP повторно каждые несколько секунд).
+    if !TRACE_ARP || frame.len() < 42 {
         return;
     }
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);

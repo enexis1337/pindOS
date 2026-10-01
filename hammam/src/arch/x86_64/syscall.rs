@@ -192,7 +192,7 @@ pub extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 }
 
 fn sys_yield() -> i64 {
-    kprintln!("[syscall] yield called");
+    if crate::sched::SCHED_DEBUG { kprintln!("[syscall] yield called"); }
     crate::sched::yield_now();
     0
 }
@@ -250,7 +250,7 @@ fn sys_dma_alloc(pages: u64, out: u64) -> i64 {
     }
     let order_pages = 1u64 << order;
 
-    kprintln!("[dma] request {} pages", pages);
+    if crate::sched::SCHED_DEBUG { kprintln!("[dma] request {} pages", pages); }
     // Виртуальное окно выдаётся подряд с bumping-счётчика: раньше virt всегда
     // равнялся DMA_BASE, поэтому второй запрос упирался в уже занятую страницу
     // и DMA-памяти хватало ровно на один блок.
@@ -291,7 +291,9 @@ fn sys_dma_alloc(pages: u64, out: u64) -> i64 {
                 )
             };
             if res.is_err() {
-                kprintln!("[dma] map_page failed at {:#x}", virt + i * PAGE);
+                if crate::sched::SCHED_DEBUG {
+                    kprintln!("[dma] map_page failed at {:#x}", virt + i * PAGE);
+                }
                 return -12;
             }
         }
@@ -311,8 +313,10 @@ fn sys_dma_alloc(pages: u64, out: u64) -> i64 {
     };
     let _ = user;
 
-    kprintln!("[dma] alloc {} pages (order {}): virt={:#x} phys={:#x}",
-        pages, order, virt, frame.start_address);
+    if crate::sched::SCHED_DEBUG {
+        kprintln!("[dma] alloc {} pages (order {}): virt={:#x} phys={:#x}",
+            pages, order, virt, frame.start_address);
+    }
     0
 }
 
@@ -348,7 +352,9 @@ fn sys_exit(code: i32) -> i64 {
 
 /// write(fd, buf, count) — вывести данные на serial
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
-    kprintln!("[syscall] write: fd={} buf={:#x} len={}", fd, buf_ptr, len);
+    if crate::sched::SCHED_DEBUG {
+        kprintln!("[syscall] write: fd={} buf={:#x} len={}", fd, buf_ptr, len);
+    }
     if fd != 1 {
         return -9;
     }
@@ -361,7 +367,7 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
         Err(_) => return -14,
     };
 
-    kprintln!("[syscall] write: validated, len={}", slice.len());
+    if crate::sched::SCHED_DEBUG { kprintln!("[syscall] write: validated, len={}", slice.len()); }
     let prefix = b"[USERSPACE] ";
     unsafe {
         for &b in prefix {

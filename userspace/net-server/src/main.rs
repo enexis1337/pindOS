@@ -214,6 +214,11 @@ fn main() -> i32 {
     let mut idle_polls: u64 = 0;
     let mut iface_routes_ready = false;
     let mut ping = PingState::new(PING_IDENT, gateway);
+    // Шлюз ещё не в neighbor cache: пока не разрезолвен MAC, ICMP-пакеты
+    // smoltcp буферизует и они не уходят. Поэтому первый echo ждёт ARP.
+    let mut arp_ready = false;
+    let mut last_diag_ms: u64 = 0;
+    let mut polls_this_sec: u64 = 0;
     println!("[net-server] ping: {} packets to {}, interval={}ms timeout={}ms",
         PING_COUNT, gateway, PING_INTERVAL_MS, PING_TIMEOUT_MS);
     loop {
@@ -223,14 +228,6 @@ fn main() -> i32 {
         let now_ms = sys_time();
         let now = Instant::from_millis(now_ms as i64);
         iface.poll(now, &mut device, &mut sockets);
-
-        // smoltcp не начинает ARP-резолвинг, пока некуда отправлять пакет.
-        // Периодически шлём UDP на шлюз: это заставляет интерфейс искать его
-        // MAC через ARP (и, transitively, даёт трафик для 5d).
-        // Диагностика RX-кольца раз в 20000 итераций.
-        if idle_polls % 20000 == 0 && idle_polls > 0 {
-            unsafe { device.rx_queue.dump_rx_state("poll") };
-        }
 
         // 5d: ping. Приём EchoReply: сверяем ident/seq и печатаем RTT.
         // smoltcp отдаёт полезную нагрузку и адрес источника; ident он уже
@@ -269,6 +266,14 @@ fn main() -> i32 {
         }
 
         // Отправляем очередной echo, если пора и ещё не исчерпали счётчик.
+        if !arp_ready && device.arp_reply_rx > 0 {
+            arp_ready = true;
+        }
+
+        // Отправку НЕ блокируем ожиданием ARP: smoltcp сам инициирует
+        // ARP-резолвинг шлюза при первой попытке отправки и доотправляет
+        // пакет после ответа. Ожидание arp_ready здесь давало deadlock —
+        // инициатора ARP без работающего ping не существовало.
         if ping.should_send(now_ms) {
             let seq = ping.take_next_seq();
             let repr = Icmpv4Repr::EchoRequest {
@@ -320,11 +325,26 @@ fn main() -> i32 {
         // Иначе процесс, которому нечего обрабатывать, занимает квант
         // целиком и dealduck ждёт следующего тика.
         idle_polls += 1;
-        sys_yield();
 
-        if idle_polls % 2000 == 0 {
-            println!("[net-server] idle polls: {}", idle_polls);
+        // Пункт 2: раз в секунду снимаем состояние ICMP и интерфейса.
+        let diag_ms = sys_time();
+        if DIAG && diag_ms.wrapping_sub(last_diag_ms) >= 1000 {
+            last_diag_ms = diag_ms;
+            let (tx_used, tx_cap) = {
+                let sk = sockets.get_mut::<icmp::Socket>(icmp_handle);
+                (sk.payload_send_capacity(), sk.packet_send_capacity())
+            };
+            let delay = iface.poll_delay(now, &sockets);
+            // Статус устройства: 0x07 = DRIVER_OK, 0x47 = NEEDS_RESET.
+            let st = unsafe { virtio::read_status(pci_dev.bar0) };
+            println!("[diag] polls/s={} frames_rx={} arp_replies={} icmp_tx_left={} tx_cap={} poll_delay={:?} in_flight={} status={:#04x}",
+                polls_this_sec, device.frames_rx, device.arp_reply_rx, tx_used, tx_cap, delay, ping.n_in_flight, st);
+            polls_this_sec = 0;
+        } else {
+            polls_this_sec += 1;
         }
+
+        sys_yield();
     }
 }
 
@@ -401,6 +421,10 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 // ── 5d: ICMP echo (ping) до шлюза QEMU ───────────────────────────────────────
 
 /// ident нашего ping. Настоящий ping берёт его из PID.
+/// Печать раз в секунду: счётчики poll, состояние приёма, ICMP-буфер, статус
+/// устройства. Под флагом только печать — ни портов, ни памяти.
+const DIAG: bool = true;
+
 const PING_IDENT: u16 = 0x1234;
 /// Сколько echo-запросов отправляем.
 const PING_COUNT: u32 = 4;
