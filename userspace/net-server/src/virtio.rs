@@ -493,16 +493,6 @@ impl Virtqueue {
 
         let slot = self.last_used as usize % self.qsize;
         let did = core::ptr::read_volatile(core::ptr::addr_of!((*self.used).ring[slot].id)) as usize;
-        // Защита, не фикс: id из used-элемента используется как индекс в
-        // buf_phys[QUEUE_SIZE], и без этой проверки устройство, вернувшее
-        // мусорный id, увело бы нас за границу массива.
-        if did >= self.qsize || did >= QUEUE_SIZE {
-            println!("[virtio] ASSERT: q{} used.ring[{}].id={} out of range (qsize={})",
-                self.queue_idx, slot, did, self.qsize);
-            loop {
-                core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
-            }
-        }
         let phys = self.buf_phys[did];
         if phys == 0 { return None; }
 

@@ -328,15 +328,17 @@ fn main() -> i32 {
 
         // Пункт 2: раз в секунду снимаем состояние ICMP и интерфейса.
         let diag_ms = sys_time();
-        if diag_ms.wrapping_sub(last_diag_ms) >= 1000 {
+        if DIAG && diag_ms.wrapping_sub(last_diag_ms) >= 1000 {
             last_diag_ms = diag_ms;
             let (tx_used, tx_cap) = {
                 let sk = sockets.get_mut::<icmp::Socket>(icmp_handle);
                 (sk.payload_send_capacity(), sk.packet_send_capacity())
             };
             let delay = iface.poll_delay(now, &sockets);
-            println!("[diag] polls/s={} frames_rx={} arp_replies={} icmp_tx_left={} tx_cap={} poll_delay={:?} in_flight={}",
-                polls_this_sec, device.frames_rx, device.arp_reply_rx, tx_used, tx_cap, delay, ping.n_in_flight);
+            // Статус устройства: 0x07 = DRIVER_OK, 0x47 = NEEDS_RESET.
+            let st = unsafe { virtio::read_status(pci_dev.bar0) };
+            println!("[diag] polls/s={} frames_rx={} arp_replies={} icmp_tx_left={} tx_cap={} poll_delay={:?} in_flight={} status={:#04x}",
+                polls_this_sec, device.frames_rx, device.arp_reply_rx, tx_used, tx_cap, delay, ping.n_in_flight, st);
             polls_this_sec = 0;
         } else {
             polls_this_sec += 1;
@@ -419,6 +421,10 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 // ── 5d: ICMP echo (ping) до шлюза QEMU ───────────────────────────────────────
 
 /// ident нашего ping. Настоящий ping берёт его из PID.
+/// Печать раз в секунду: счётчики poll, состояние приёма, ICMP-буфер, статус
+/// устройства. Под флагом только печать — ни портов, ни памяти.
+const DIAG: bool = true;
+
 const PING_IDENT: u16 = 0x1234;
 /// Сколько echo-запросов отправляем.
 const PING_COUNT: u32 = 4;
