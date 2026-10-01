@@ -262,7 +262,13 @@ fn main() -> i32 {
         if ping.done() {
             println!("[ping] finished: {} sent, {} replied, {} timed out",
                 ping.sent, ping.replies, ping.timeouts);
-            return 0;
+            if SELFTEST_PING {
+                return 0;
+            }
+            // Обычный режим: тест отработал, но процесс остаётся сервисом.
+            // Новых запросов не будет, poll loop продолжает крутиться.
+            println!("[net-server] ping test done, staying in service loop");
+            ping.disable();
         }
 
         // Отправляем очередной echo, если пора и ещё не исчерпали счётчик.
@@ -425,6 +431,14 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 /// устройства. Под флагом только печать — ни портов, ни памяти.
 const DIAG: bool = false;
 
+/// Пропустить ping-тест при старте и выйти с кодом 0 после него.
+///
+/// В обычной загрузке выключено: net-server должен остаться постоянным
+/// сервисом в poll loop, а тест — это самопроверка сборки. С включённым флагом
+/// процесс отрабатывает тест один раз и завершается с 0, что удобно для
+/// автоматической проверки в CI.
+const SELFTEST_PING: bool = false;
+
 const PING_IDENT: u16 = 0x1234;
 /// Сколько echo-запросов отправляем.
 const PING_COUNT: u32 = 4;
@@ -453,6 +467,8 @@ struct PingState {
     in_flight:   [(u16, u64); 8],
     n_in_flight: usize,
     last_send:   u64,
+    /// Тест отработал и больше не должен слать запросы.
+    finished:    bool,
 }
 
 impl PingState {
@@ -467,11 +483,13 @@ impl PingState {
             in_flight: [(0, 0); 8],
             n_in_flight: 0,
             last_send: 0,
+            finished: false,
         }
     }
 
     /// Пора ли слать следующий запрос: интервал вышел и лимит не исчерпан.
     fn should_send(&self, now_ms: u64) -> bool {
+        if self.finished { return false; }
         if self.sent >= PING_COUNT { return false; }
         if self.sent == 0 { return true; }
         now_ms.wrapping_sub(self.last_send) >= PING_INTERVAL_MS
@@ -527,6 +545,11 @@ impl PingState {
     }
 
     fn done(&self) -> bool {
-        self.replies + self.timeouts >= PING_COUNT
+        !self.finished && self.replies + self.timeouts >= PING_COUNT
+    }
+
+    /// Завершить тест: новых запросов больше не будет.
+    fn disable(&mut self) {
+        self.finished = true;
     }
 }
