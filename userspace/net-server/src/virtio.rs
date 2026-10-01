@@ -83,6 +83,8 @@ pub struct Virtqueue {
     buf_phys: [u64; QUEUE_SIZE],
     /// Следующий свободный дескриптор для TX.
     next_tx: u16,
+    /// Сколько элементов used-кольца TX-очереди мы уже забрали.
+    last_tx: u16,
 }
 
 unsafe fn dbg_outb(port: u16, val: u8) {
@@ -248,7 +250,7 @@ impl Virtqueue {
 
         dbg_str("[virtio] init done\n");
 
-        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, qsize, buf_phys: [0u64; QUEUE_SIZE], next_tx: 0 };
+        let mut q = Self { desc, avail, used, free_head: 0, last_used: 0, io_base, queue_idx, qsize, buf_phys: [0u64; QUEUE_SIZE], next_tx: 0, last_tx: 0 };
         // Для RX-очереди дескрипторы должны быть опубликованы в avail ring:
         // иначе у устройства нет ни одного буфера, куда писать, used.idx
         // никогда не растёт и recv() всегда возвращает None.
@@ -329,11 +331,18 @@ impl Virtqueue {
         }
         core::ptr::copy_nonoverlapping(data.as_ptr(), d.add(VIRTIO_NET_HDR_LEN), data.len());
 
-        // Свободный дескриптор для TX берём по счётчику: поле `next` больше не
-        // используется как free-list (дескрипторы не связаны в цепочку).
-        let idx = self.next_tx as usize;
-        if idx >= self.qsize { return; }
-        self.next_tx += 1;
+        // Свободный дескриптор для TX берём из used-элемента: устройство
+        // вернуло его после обработки, значит он свободен. Раньше здесь был
+        // монотонный next_tx, который исчерпывался после qsize отправок, и
+        // send() молча терял кадры — из-за этого вставал и RX, просто потому
+        // что трафика больше не было.
+        let idx = match unsafe { self.pop_free_tx() } {
+            Some(i) => i,
+            None => {
+                dbg_str("[virtio] TX: no free descriptors, send dropped\n");
+                return;
+            }
+        };
 
         (*self.desc.add(idx)).addr  = dphys;
         (*self.desc.add(idx)).len   = total as u32;
@@ -346,6 +355,33 @@ impl Virtqueue {
         fence(Ordering::Release);
 
         outw(self.io_base + REG_QUEUE_NOTIFY, self.queue_idx);
+    }
+
+    /// Забирает свободный TX-дескриптор из used-кольца.
+    ///
+    /// used.idx монотонно указывает на элементы, которые устройство
+    /// обработало; last_tx — сколько из них мы уже забрали. Элемент
+    /// освободил дескриптор, значит его можно использовать снова.
+    /// Забирает свободный TX-Дескриптор.
+    ///
+    /// next_tx — сколько дескрипторов отдано в кольцо, last_tx — сколько из них
+    /// устройство вернуло через used. Значит «в полёте» ровно next_tx-last_tx
+    /// дескрипторов, а свободно qsize минус это число. Индекс берём как
+    /// next_tx % qsize, то есть кольцевой: раньше он рос монотонно и упирался
+    /// в qsize, после чего send() молча терял все кадры.
+    unsafe fn pop_free_tx(&mut self) -> Option<usize> {
+        let used_idx = core::ptr::read_volatile(&(*self.used).idx);
+        // Учитываем только возвраты, которые мы ещё не забрали.
+        if last_after(self.last_tx, used_idx) {
+            self.last_tx = used_idx;
+        }
+        let in_flight = (self.next_tx.wrapping_sub(self.last_tx)) as usize;
+        if in_flight >= self.qsize {
+            return None;
+        }
+        let idx = self.next_tx as usize % self.qsize;
+        self.next_tx = self.next_tx.wrapping_add(1);
+        Some(idx)
     }
 
     /// Периодическая диагностика состояния RX-кольца.
@@ -438,6 +474,12 @@ pub fn dma_alloc_pages(pages: usize) -> (u64, u64) {
 /// Округляет `v` вверх до кратного `align` (степень двойки).
 const fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) & !(align - 1)
+}
+
+/// true, если `a` — более позднее значение счётчика, чем `b`, с учётом
+/// переполнения u16. Счётчики монотонны и переворачиваются через 65535.
+const fn last_after(a: u16, b: u16) -> bool {
+    a != b && (a.wrapping_sub(b) as i16) < 0
 }
 
 unsafe fn inb(port: u16) -> u8 {

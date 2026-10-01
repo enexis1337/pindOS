@@ -222,6 +222,7 @@ fn main() -> i32 {
             }
         }
         if device.frames_rx >= STRESS_FRAMES {
+            unsafe { device.rx_queue.dump_rx_state("final") };
             println!("[net-server] RX stress OK: frames_rx={} frames_tx={}", device.frames_rx, device.frames_tx);
             return 0;
         }
