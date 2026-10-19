@@ -188,6 +188,10 @@ pub extern "C" fn _start_multiboot2(magic: u32, mbi_ptr: u32) -> ! {
     // процессов (иначе первый тик таймера даст #PF в адресном пространстве PID 1).
     arch::x86_64::apic::init_timer_only();
     kprintln!("[OK] Local APIC timer initialized");
+    crate::sched::init_idle();
+
+    #[cfg(feature = "sched-test")]
+    crate::sched::blocking_test::run();
 
     // Load ELF via Process as PID 1
     let init_process = process::Process::from_elf(1, &elf_data)

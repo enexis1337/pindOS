@@ -87,6 +87,8 @@ pub unsafe fn set_idt_entry(vector: u8, handler: u64, ist: u8) {
 #[unsafe(naked)]
 pub unsafe extern "C" fn timer_interrupt_entry() {
     core::arch::naked_asm!(
+        // IDT сейчас использует trap gate; явно запретить вложенный таймер.
+        "cli",
         // Simple handler: save minimal registers, call tick, EOI, iretq
         "push rax",
         "push rcx",
@@ -102,6 +104,8 @@ pub unsafe extern "C" fn timer_interrupt_entry() {
         // и заблокирует все дальнейшие таймерные прерывания.
         "call {}",
         "call {}",
+        // Девять сохранённых GPR (72 байта), затем аппаратные RIP и CS.
+        "mov rdi, [rsp + 80]",
         "call {}",
         "pop r11",
         "pop r10",

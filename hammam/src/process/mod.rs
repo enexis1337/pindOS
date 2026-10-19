@@ -181,7 +181,7 @@ impl Process {
             *stack_ptr = crate::arch::x86_64::syscall::return_to_userspace_trampoline as u64;
             (*task_ptr).context.rsp = stack_ptr as u64;
             (*task_ptr).context.cr3 = as_root.start_address;
-            (*task_ptr).state = TaskState::Ready;
+            (*task_ptr).set_state(TaskState::Ready);
             (*task_ptr).user_entry = entry_point;
             (*task_ptr).user_stack = user_stack_top;
         }

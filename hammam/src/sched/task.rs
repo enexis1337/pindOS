@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 pub const STACK_SIZE: usize = 4096 * 4;
 
@@ -15,12 +15,29 @@ pub const STACK_SIZE: usize = 4096 * 4;
 pub struct TaskId(pub u64);
 
 /// Состояние задачи в планировщике.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
-    Running,
-    Ready,
-    Blocked,
-    Dead,
+    Running = 0,
+    Ready = 1,
+    Blocked = 2,
+    Dead = 3,
+}
+
+impl TaskState {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Running,
+            1 => Self::Ready,
+            2 => Self::Blocked,
+            3 => Self::Dead,
+            _ => unreachable!("invalid task state"),
+        }
+    }
+
+    const fn as_raw(self) -> u8 {
+        self as u8
+    }
 }
 
 /// Адресное пространство процесса: собственный корень иерархии страниц (PML4).
@@ -127,7 +144,8 @@ impl KernelStack {
 /// Задача ядра Hammam.
 pub struct Task {
     pub id: TaskId,
-    pub state: TaskState,
+    state: AtomicU8,
+    pub wait_key: AtomicU64,
     pub priority: i32,
     pub context: ArchContext,
     pub kernel_stack: KernelStack,
@@ -141,7 +159,8 @@ impl Task {
     pub fn new(id: TaskId, priority: i32, address_space: Arc<Mutex<AddressSpace>>) -> Self {
         Self {
             id,
-            state: TaskState::Ready,
+            state: AtomicU8::new(TaskState::Ready.as_raw()),
+            wait_key: AtomicU64::new(0),
             priority,
             context: ArchContext::default(),
             kernel_stack: KernelStack::new(),
@@ -150,5 +169,29 @@ impl Task {
             user_entry: 0,
             user_stack: 0,
         }
+    }
+
+    pub fn state(&self) -> TaskState {
+        TaskState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn set_state(&self, state: TaskState) {
+        self.state.store(state.as_raw(), Ordering::Release);
+    }
+
+    pub fn cas_state(
+        &self,
+        current: TaskState,
+        next: TaskState,
+    ) -> Result<TaskState, TaskState> {
+        self.state
+            .compare_exchange(
+                current.as_raw(),
+                next.as_raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(TaskState::from_raw)
+            .map_err(TaskState::from_raw)
     }
 }

@@ -4,8 +4,11 @@ use crate::drivers::serial::SpinMutex;
 /// Размер кучи ядра
 pub const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
+#[repr(align(16))]
+struct AlignedHeapSpace([u8; HEAP_SIZE]);
+
 /// Статическая область памяти в секции BSS, используемая в качестве кучи ядра.
-static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+static mut HEAP_SPACE: AlignedHeapSpace = AlignedHeapSpace([0; HEAP_SIZE]);
 
 /// Узел связного списка свободных блоков памяти кучи (инлайн-хранение).
 struct Hole {
@@ -129,7 +132,7 @@ impl LockedHeap {
     pub unsafe fn init(&self) {
         let mut allocator = self.0.lock();
         unsafe {
-            let start = core::ptr::addr_of_mut!(HEAP_SPACE) as usize;
+            let start = core::ptr::addr_of_mut!(HEAP_SPACE.0) as usize;
             allocator.init(start, HEAP_SIZE);
         }
     }

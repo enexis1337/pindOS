@@ -48,6 +48,8 @@ pub fn timer_reload() -> u32 {
 /// ДО планировщика: если планировщик переключит контекст, счётчик уже учтён.
 pub fn tick_advance() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "sched-test")]
+    crate::sched::blocking_test::on_tick(uptime_millis());
     // Приём COM1: прерывание UART включено, но через IO-APIC не
     // маршрутизируется, поэтому забираем байты опросом LSR из тика.
     unsafe {
