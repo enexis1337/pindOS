@@ -93,6 +93,7 @@ pub extern "C" fn _start() -> ! {
     let mut manager = ServiceManager::new();
 
     manager.register("net-server", "/usr/bin/net-server");
+    manager.register("echo-test", "/usr/bin/echo-test");
 
     println!("[dealduck] starting services...");
     manager.start_all();

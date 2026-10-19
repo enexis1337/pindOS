@@ -371,9 +371,9 @@ def cmd_test():
     # Порядок важен: userspace-бинари встраиваются в ядро через include_bytes!,
     # поэтому собираем их ДО ядра, иначе ядро утащит устаревшие ELF.
     print("  Сборка userspace (встраивается в ядро)...")
-    for d in ("userspace/net-server", "dealduck"):
+    for d in ("userspace/net-server", "userspace/echo-test", "dealduck"):
         run(["cargo", "build", "--release", "--target", TARGET],
-            cwd=ROOT / d, check=False)
+            cwd=ROOT / d)
 
     print("  Сборка Hammam kernel...")
     run(["cargo", "build", "--target", TARGET], cwd=HAMMAM_DIR)

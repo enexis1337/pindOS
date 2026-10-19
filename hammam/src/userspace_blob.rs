@@ -10,14 +10,20 @@ pub const NET_SERVER_ELF: &[u8] = include_bytes!(
     "../../userspace/net-server/target/x86_64-unknown-none/release/net-server"
 );
 
+/// Echo-test — блокирующее чтение консоли, запускается рядом с net-server.
+pub const ECHO_TEST_ELF: &[u8] = include_bytes!(
+    "../../userspace/echo-test/target/x86_64-unknown-none/release/echo-test"
+);
+
 /// systemd-стиль unit-файл для net-server
 pub const NET_SERVER_SERVICE: &[u8] = b"[Unit]\nDescription=PINDOS Network Stack\n\n[Service]\nType=simple\nExecStart=/usr/bin/net-server\nRestart=on-failure\n";
 
-/// Build a CPIO newc archive containing /init (dealduck) and /usr/bin/net-server
+/// Build a CPIO newc archive containing /init, net-server and echo-test.
 pub fn build_initramfs() -> Vec<u8> {
     let mut cpio = Vec::new();
     append_cpio_entry(&mut cpio, b"/init", DEALDUCK_ELF);
     append_cpio_entry(&mut cpio, b"/usr/bin/net-server", NET_SERVER_ELF);
+    append_cpio_entry(&mut cpio, b"/usr/bin/echo-test", ECHO_TEST_ELF);
     append_cpio_entry(&mut cpio, b"/etc/pindos/system/net-server.service", NET_SERVER_SERVICE);
     append_cpio_trailer(&mut cpio);
     cpio
