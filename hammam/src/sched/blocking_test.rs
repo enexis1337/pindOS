@@ -11,6 +11,10 @@ static IDLE_HITS: AtomicUsize = AtomicUsize::new(0);
 static START: AtomicU64 = AtomicU64::new(0);
 
 pub fn idle_entered() {
+    let current = get_current_task().unwrap();
+    assert_eq!(crate::mm::active_pml4().start_address,
+        current.address_space.lock().root_pml4.start_address);
+    assert_eq!(current.kernel_stack.top & 15, 0);
     IDLE_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -123,6 +127,19 @@ pub fn run() -> ! {
     let b = create_kernel_thread(waker);
     {
         let mut scheduler = SCHEDULER.lock();
+        let idle = scheduler.idle.as_ref().unwrap();
+        let aspace = idle.address_space.lock();
+        assert_eq!(idle.context.cr3, aspace.root_pml4.start_address);
+        assert_ne!(idle.context.cr3, crate::mm::active_pml4().start_address);
+        assert_eq!(aspace.translate(idle_main as *const () as u64),
+            Some(idle_main as *const () as u64));
+        assert_eq!(aspace.translate((idle.kernel_stack.top - 1) as u64),
+            Some((idle.kernel_stack.top - 1) as u64));
+        assert_eq!(idle.kernel_stack.top & 15, 0);
+        assert_ne!(idle.kernel_stack.top, a.kernel_stack.top);
+        assert_ne!(idle.kernel_stack.top, b.kernel_stack.top);
+        drop(aspace);
+        kprintln!("[block-test] PASS idle: private kernel CR3, mapped code/stack, own aligned stack");
         scheduler.add_task(a);
         scheduler.add_task(b);
     }

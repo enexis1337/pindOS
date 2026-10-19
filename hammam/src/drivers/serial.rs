@@ -194,39 +194,36 @@ pub static SERIAL: SerialPort = SerialPort(UnsafeCell::new(Serial::new(COM1_BASE
 /// Ёмкость кольцевого буфера приёма COM1.
 pub const RX_RING_SIZE: usize = 256;
 
-/// Кольцевой буфер приёма COM1.
-///
-/// Заполняется из таймерного тика, поэтому работает без аллокаций и без
-/// прерываний: это важно, пока приём UART не подключён к IO-APIC.
-/// Индексы монотонные и оборачиваются по маске, буфер — степени двойки.
+/// SPSC-кольцо: producer (timer IRQ) меняет только head, consumer (sys_read)
+/// меняет только tail. Несколько readers сериализованы IF=0 на одном CPU;
+/// для SMP понадобится отдельная сериализация consumers.
+/// Один слот оставлен пустым для различения полного и пустого кольца.
 pub struct RxRing {
-    /// Буфер в UnsafeCell: пишет и читает контекст прерывания/тика.
-    buf:   core::cell::UnsafeCell<[u8; RX_RING_SIZE]>,
-    head:  core::sync::atomic::AtomicUsize,
-    tail:  core::sync::atomic::AtomicUsize,
+    buf: UnsafeCell<[u8; RX_RING_SIZE]>,
+    head: core::sync::atomic::AtomicUsize,
+    tail: core::sync::atomic::AtomicUsize,
 }
 
 impl RxRing {
     pub const fn new() -> Self {
         Self {
-            buf: core::cell::UnsafeCell::new([0; RX_RING_SIZE]),
+            buf: UnsafeCell::new([0; RX_RING_SIZE]),
             head: core::sync::atomic::AtomicUsize::new(0),
             tail: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Положить байт. Переполнение молча теряет самый старый байт: консоль
-    /// не должна ронять систему из-за темпа набора.
-    pub fn push(&self, b: u8) {
+    /// При переполнении теряем новый байт, не меняя принадлежащий consumer tail.
+    pub fn push(&self, b: u8) -> bool {
         let head = self.head.load(Ordering::Relaxed);
         let next = (head + 1) & (RX_RING_SIZE - 1);
-        if next == self.tail.load(Ordering::Relaxed) {
-            let t = self.tail.load(Ordering::Relaxed);
-            self.tail.store((t + 1) & (RX_RING_SIZE - 1), Ordering::Relaxed);
+        if next == self.tail.load(Ordering::Acquire) {
+            return false;
         }
-        // SAFETY: единственный писатель — контекст прерывания/тика.
+        // SAFETY: producer владеет свободным слотом до публикации head.
         unsafe { (*self.buf.get())[head] = b; }
-        self.head.store((head + 1) & (RX_RING_SIZE - 1), Ordering::Release);
+        self.head.store(next, Ordering::Release);
+        true
     }
 
     /// Забрать один байт, если есть.
@@ -235,39 +232,24 @@ impl RxRing {
         if tail == self.head.load(Ordering::Acquire) {
             return None;
         }
-        // SAFETY: единственный читатель — задача в системном вызове.
+        // SAFETY: producer опубликовал байт и не переиспользует слот до tail.store.
         let b = unsafe { (*self.buf.get())[tail] };
         self.tail.store((tail + 1) & (RX_RING_SIZE - 1), Ordering::Release);
         Some(b)
     }
 
-    /// Есть ли что читать.
     pub fn has_data(&self) -> bool {
         self.tail.load(Ordering::Acquire) != self.head.load(Ordering::Acquire)
     }
 }
 
+// SAFETY: один producer; consumers сериализованы невытесняемым syscall на UP.
 unsafe impl Sync for RxRing {}
 
-/// Отдельный контекстный буфер для эха: пока sys_read не готов, кольцо
-/// возвращается обратно в порт, чтобы было видно, что приём вообще идёт.
-pub static RX_ECHO: SpinMutex<RxRing> = SpinMutex::new(RxRing::new());
-
-/// Переложить принятое из кольца в эхо-буфер.
-pub fn push_rx_echo(b: u8) {
-    RX_ECHO.lock().push(b);
-}
-
-/// Забрать накопленное из эхо-буфера, если есть.
-pub fn pop_rx_echo() -> Option<u8> {
-    RX_ECHO.lock().pop()
-}
-
-pub fn has_rx_echo() -> bool {
-    RX_ECHO.lock().has_data()
-}
-
 pub static RX_RING: RxRing = RxRing::new();
+
+/// Только диагностическая печать: приём, публикация и wake не зависят от эха.
+const CONSOLE_ECHO: bool = false;
 
 /// Забрать всё накопленное с COM1 в кольцевой буфер ядра.
 ///
@@ -279,8 +261,12 @@ pub unsafe fn poll_serial_rx() -> usize {
     unsafe {
         while SERIAL.get().is_receive_ready() {
             let b = SERIAL.get().read_byte();
-            RX_RING.push(b);
-            push_rx_echo(b);
+            if RX_RING.push(b) {
+                crate::sched::wake(crate::sched::WAIT_CONSOLE);
+            }
+            if CONSOLE_ECHO {
+                SERIAL.get().write_byte(b);
+            }
             n += 1;
             if n >= RX_RING_SIZE { break; }
         }

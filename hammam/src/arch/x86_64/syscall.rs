@@ -1,5 +1,5 @@
 use crate::kprintln;
-use crate::mm::userptr::validate_user_slice;
+use crate::mm::userptr::{validate_user_slice, validate_user_slice_mut};
 use crate::sched::task::AddressSpace;
 use crate::process::{PROCESS_TABLE, next_pid, Process};
 use crate::vfs::VFS;
@@ -186,6 +186,7 @@ pub extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         3 => sys_waitpid(a0, a1),
         4 => sys_time(),
         5 => sys_dma_alloc(a0, a1),
+        6 => sys_read(a0, a1, a2),
         60 => sys_exit(a0 as i32),
         _ => -38,
     }
@@ -355,6 +356,62 @@ fn sys_exit(code: i32) -> i64 {
 fn find_process_by_task(task: &crate::sched::task::Task) -> Option<alloc::sync::Arc<crate::process::Process>> {
     let pid = task.id.0 as u32;
     PROCESS_TABLE.lock().get(&pid).cloned()
+}
+
+/// read(fd, buf, count) — ждать хотя бы один байт и вернуть доступные данные.
+fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
+    // Не сужать fd до u32 до проверки: 0x1_0000_0000 не должен стать stdin.
+    if fd != 0 {
+        return -9;
+    }
+    {
+        let current = match crate::sched::get_current_task() {
+            Some(t) => t,
+            None => return -9,
+        };
+        let proc = match find_process_by_task(current) {
+            Some(p) => p,
+            None => return -9,
+        };
+        if !proc.fd_table.lock().is_readable(0) {
+            return -9;
+        }
+        if len == 0 {
+            return 0;
+        }
+        let aspace = current.address_space.lock();
+        if validate_user_slice_mut(&aspace, buf_ptr, len).is_err() {
+            return -14;
+        }
+    }
+    // Ни lock, ни &mut пользовательского буфера не живут на спящем стеке.
+    let ring = &crate::drivers::serial::RX_RING;
+    while !ring.has_data() {
+        if crate::sched::block_current(crate::sched::WAIT_CONSOLE, || ring.has_data()).is_err() {
+            return -11;
+        }
+        // wake будит всех readers: другой reader мог уже забрать байт.
+    }
+
+    let current = crate::sched::get_current_task().expect("no current task");
+    let aspace = current.address_space.lock();
+    let slice = match validate_user_slice_mut(&aspace, buf_ptr, len) {
+        Ok(s) => s,
+        Err(_) => return -14,
+    };
+    let mut copied = 0;
+    // TODO(SMAP): stac/clac вокруг копирования в пользовательский буфер.
+    // IF=0 на всём пути syscall: несколько consumers не пересекаются на UP.
+    for dest in slice {
+        match ring.pop() {
+            Some(b) => {
+                *dest = b;
+                copied += 1;
+            }
+            None => break,
+        }
+    }
+    copied
 }
 
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {

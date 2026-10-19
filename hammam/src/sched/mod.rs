@@ -427,7 +427,7 @@ pub fn create_kernel_thread(main: extern "C" fn() -> !) -> Arc<Task> {
     unsafe {
         let task_ptr = Arc::as_ptr(&task) as *mut Task;
         (*task_ptr).context.rsp = stack_ptr as u64;
-        (*task_ptr).context.cr3 = crate::mm::active_pml4().start_address;
+        (*task_ptr).context.cr3 = task.address_space.lock().root_pml4.start_address;
         (*task_ptr).set_state(TaskState::Ready);
     }
 

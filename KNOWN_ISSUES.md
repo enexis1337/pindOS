@@ -78,6 +78,15 @@ qemu-system-x86_64: virtio: zero sized buffers are not allowed
 - Kernel-код не вытесняется таймером: он может удерживать heap/physical lock.
   Kernel-потоки уступают CPU через `yield_now`/`block_current`; таймер продолжает
   считать время и выполнять `wake`. Userspace остаётся вытесняемым.
+- В syscall IF сброшен через SFMASK: во время долгого syscall тики не приходят
+  (пропущенные периоды не компенсируются), поэтому `sys_time` отстаёт от реального
+  времени. Опрос COM1 тоже идёт из тика: аппаратный FIFO UART на 16 байт может
+  переполниться до следующего опроса. Это отдельно от запрета вытеснять kernel-код
+  при IF=1: в таком kernel-потоке timer IRQ продолжает обслуживаться.
+- `syscall_entry` использует `r10` как scratch для user RSP и не восстанавливает
+  его. Userspace inline asm должен объявлять clobber `rax`, `rcx`, `r10`, `r11`;
+  старые wrappers проверены на это не полностью. Новый read-probe объявляет все
+  четыре. Сохранение `r10` и аудит старых wrappers — отдельная задача.
 - Timer IRQ не меняет размер `BTreeMap`: переключение заменяет `Arc` внутри
   существующего узла. Выбор сравнивает актуальные `vruntime` за O(n), а не O(log n).
   Разбуженные задачи попадают в дерево из idle/обычного scheduler-контекста.
@@ -88,3 +97,20 @@ qemu-system-x86_64: virtio: zero sized buffers are not allowed
   `DATA_BOOT_VADDR`; штатные `boot.rs`, Cargo-артефакты и ISO не меняет.
   До первого запуска должны быть собраны release-бинари net-server и dealduck,
   поскольку initramfs по-прежнему встраивается, хотя userspace тест не запускает.
+
+## Консольный read (3b)
+
+- Syscall 6: читать можно только fd 0 с правом `readable` в таблице текущего
+  процесса. `len=0` не спит; остальные чтения ждут хотя бы один байт и возвращают
+  доступные данные (не более `len`). Wake-all требует повторной проверки условия.
+- Кольцо SPSC имеет 256 слотов, полезная ёмкость — 255 байтов. При переполнении
+  теряется новый байт: producer никогда не двигает consumer-owned `tail`.
+  Несколько readers сериализованы IF=0 на UP, для SMP это не готово.
+- Kernel echo отключён `CONSOLE_ECHO=false`. Приём и `wake` от константы не зависят.
+- До включения SMAP нужны `stac`/`clac` вокруг копирования в user buffer (TODO
+  находится в `sys_read`).
+- Регрессии: `rustc --edition=2021 --test tools/test_console_ring.rs -o /tmp/pindos-ring-test`
+  и `/tmp/pindos-ring-test`; `python tools/test_read.py` для настоящих userspace
+  syscall, включая два конкурирующих reader и ping 4/4 без ввода. Второй тест
+  собирает probe и временный initramfs/ISO отдельно, не устанавливая сервис в
+  штатный образ. Release ELF net-server должен быть предварительно собран.
