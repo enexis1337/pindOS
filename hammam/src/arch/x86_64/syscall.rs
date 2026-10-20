@@ -345,6 +345,8 @@ fn sys_exit(code: i32) -> i64 {
             p.exit_code.store(code, Ordering::Release);
             p.is_zombie.store(true, Ordering::Release);
         }
+        // Разбудить ожидающий waitpid без аллокаций (через IRQ-safe wake).
+        crate::sched::wake(crate::sched::wait_child(pid));
     }
 
     crate::sched::exit_current();
@@ -510,24 +512,50 @@ fn sys_waitpid(pid: u64, flags: u64) -> i64 {
     let wnohang = flags & 1 != 0;
     let pid = pid as u32;
 
-    let table = PROCESS_TABLE.lock();
-    match table.get(&pid) {
-        None => -10,
-        Some(proc) => {
-            if proc.is_zombie() {
-                let code = proc.exit_code.load(Ordering::Acquire);
-                drop(table);
-                PROCESS_TABLE.lock().remove(&pid);
-                // Код возврата 0 неотличим от «процесс жив» (оба дают 0),
-                // поэтому кодируем выход как EXIT_CODE_BASE + code.
-                // Пользователь обязан вычитать базу.
-                EXIT_CODE_BASE + code as i64
-            } else if wnohang {
-                0
-            } else {
-                -11
+    // Быстрая проверка существования процесса.
+    if PROCESS_TABLE.lock().get(&pid).is_none() {
+        return -10; // ECHILD
+    }
+
+    let wait_key = crate::sched::wait_child(pid);
+
+    loop {
+        // Проверяем под отдельным захватом lock — не держим его на sleep.
+        let zombie_code = {
+            let table = PROCESS_TABLE.lock();
+            match table.get(&pid) {
+                None => return -10, // уже убран другим waitpid
+                Some(proc) if proc.is_zombie() => {
+                    Some(proc.exit_code.load(Ordering::Acquire))
+                }
+                _ => None,
             }
+        };
+
+        if let Some(code) = zombie_code {
+            PROCESS_TABLE.lock().remove(&pid);
+            // Код возврата 0 неотличим от «процесс жив» (оба дают 0),
+            // поэтому кодируем выход как EXIT_CODE_BASE + code.
+            // Пользователь обязан вычитать базу.
+            return EXIT_CODE_BASE + code as i64;
         }
+
+        if wnohang {
+            return 0; // процесс жив
+        }
+
+        // Блокируемся до wake из sys_exit. Условие: «процесс уже зомби».
+        // После пробуждения перепроверяем в цикле.
+        let is_zombie = || {
+            PROCESS_TABLE.lock()
+                .get(&pid)
+                .map(|p| p.is_zombie())
+                .unwrap_or(true) // убран = считаем завершённым
+        };
+        if crate::sched::block_current(wait_key, is_zombie).is_err() {
+            return -11; // не удалось заблокироваться (нет idle и т.п.)
+        }
+        // Цикл: перепроверяем zombie_code.
     }
 }
 
