@@ -6,7 +6,7 @@
 
 ## Project goal
 
-The long-term objective is **full compatibility with Linux and UNIX-compatible programs** on PINDOS—not a parallel ABI, but enough parity in syscalls, errno semantics, file descriptors, process lifecycle, and libc expectations that **glibc/musl-linked binaries and POSIX code** can run on Hammam. Work proceeds in layers:
+The long-term objective is **full compatibility with Linux and UNIX-compatible programs** on pindOS—not a parallel ABI, but enough parity in syscalls, errno semantics, file descriptors, process lifecycle, and libc expectations that **glibc/musl-linked binaries and POSIX code** can run on Hammam. Work proceeds in layers:
 
 | Layer | Role |
 | --- | --- |
